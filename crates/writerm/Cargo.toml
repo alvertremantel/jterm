@@ -1,0 +1,16 @@
+[package]
+name = "writerm"
+version = "0.1.0"
+edition = "2024"
+description = "A full-screen terminal Markdown writing app"
+license = "AGPL-3.0"
+authors = ["Geosmin Jones"]
+
+[[bin]]
+name = "writerm"
+path = "src/main.rs"
+
+[dependencies]
+writerm-app = { path = "../writerm-app" }
+tokio.workspace = true
+color-eyre.workspace = true

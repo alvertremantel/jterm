@@ -7,9 +7,18 @@ use ratatui::backend::CrosstermBackend;
 use std::io;
 
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    setup_terminal_with_mouse(true)
+}
+
+pub fn setup_terminal_with_mouse(
+    mouse: bool,
+) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        crossterm::execute!(stdout, EnableMouseCapture)?;
+    }
     Terminal::new(CrosstermBackend::new(stdout))
 }
 

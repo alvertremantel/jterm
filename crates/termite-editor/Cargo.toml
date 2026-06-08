@@ -7,7 +7,7 @@ license = "AGPL-3.0"
 authors = ["Geosmin Jones"]
 
 [dependencies]
-jones-text = { path = "../jones-text" }
+jones-editor = { path = "../jones-editor" }
+
+[dev-dependencies]
 crossterm.workspace = true
-color-eyre.workspace = true
-arboard = "3.4"

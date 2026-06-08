@@ -9,3 +9,4 @@ jones-syntax = { path = "../jones-syntax" }
 jones-theme = { path = "../jones-theme" }
 pulldown-cmark.workspace = true
 ratatui.workspace = true
+unicode-width = "0.2"

@@ -1,0 +1,14 @@
+[package]
+name = "writerm-config"
+version = "0.1.0"
+edition = "2024"
+description = "Writerm configuration loading and defaults"
+license = "AGPL-3.0"
+authors = ["Geosmin Jones"]
+
+[dependencies]
+jones-config = { path = "../jones-config" }
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

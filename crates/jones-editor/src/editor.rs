@@ -39,7 +39,7 @@ pub enum EditorAction {
     ReloadFile,
 }
 
-/// Wraps termite's local text buffer and editor state.
+/// Wraps shared text buffer and editor state.
 pub struct EditorContext {
     pub buffer: RopeBuffer,
     pub state: EditorState,
@@ -150,7 +150,7 @@ impl EditorContext {
     }
 
     /// Move cursor to a given char offset, updating line/col/desired_col.
-    fn move_cursor_to_char_pos(&mut self, char_pos: usize) {
+    pub fn move_cursor_to_char_pos(&mut self, char_pos: usize) {
         let rope = self.buffer.rope();
         let clamped = char_pos.min(rope.len_chars());
         let line = rope.char_to_line(clamped);
@@ -161,9 +161,14 @@ impl EditorContext {
     }
 
     /// Get the current cursor position as a char offset in the rope.
-    fn cursor_char_pos(&self) -> usize {
+    pub fn cursor_char_pos(&self) -> usize {
         let rope = self.buffer.rope();
         rope.line_to_char(self.state.cursor_line) + self.state.cursor_col
+    }
+
+    pub fn move_cursor_to_line_col(&mut self, line: usize, col: usize) {
+        let rope = self.buffer.rope();
+        self.state.move_cursor_to(line, col, rope);
     }
 
     // ── Clipboard helpers ──────────────────────────────────────────

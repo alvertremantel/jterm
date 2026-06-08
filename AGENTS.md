@@ -1,7 +1,7 @@
 # J-SUITE GUIDANCE - version 1
 
 J-Suite is the integrated Rust workspace for the Jones Suite tools. Treat the root workspace as
-authoritative and treat the suite as three applications built from many small, shared crates.
+authoritative and treat the suite as four applications built from many small, shared crates.
 
 ## Workspace authority and layout
 
@@ -21,16 +21,18 @@ If a code/config/docs discrepancy exists between `crates/` and a preserved legac
 
 ## Application map
 
-There are three end-user applications:
+There are four end-user applications:
 
 - **azide** — RSS/Atom reader with Ratatui TUI plus feed-management CLI behavior
 - **termite** — terminal text reader/editor with workspace navigation and search tools
+- **writerm** — full-screen terminal Markdown writing app with rendered editing
 - **jtop** — laptop power-management monitor/manager TUI
 
 ### Binary crates
 
 - `azide`
 - `termite`
+- `writerm`
 - `jtop`
 
 ### Azide crates
@@ -46,7 +48,12 @@ There are three end-user applications:
 
 - `termite-app` — Termite application/event-loop/TUI coordination
 - `termite-config` — Termite config loading/saving and defaults
-- `termite-editor` — editor interaction logic and editing workflows
+- `termite-editor` — compatibility re-export for shared editor behavior
+
+### Writerm crates
+
+- `writerm-app` — Writerm application/event-loop/TUI coordination
+- `writerm-config` — Writerm config loading/saving and defaults
 
 ### Jtop crates
 
@@ -56,6 +63,7 @@ There are three end-user applications:
 ### Shared Jones crates
 
 - `jones-config` — shared config helpers
+- `jones-editor` — shared editor interaction logic and editing workflows
 - `jones-event` — shared event/input helpers
 - `jones-outline` — outline extraction/breadcrumb-style structure helpers
 - `jones-project-search` — recursive project text search
@@ -92,7 +100,8 @@ Only add crate-local versions when the dependency is truly crate-specific.
 
 Licensing is intentionally **not** unified across the whole suite.
 
-- **AGPL**: `azide`, `termite`, all `azide-*`, all `termite-*`, and all `jones-*` crates
+- **AGPL**: `azide`, `termite`, `writerm`, all `azide-*`, all `termite-*`, all `writerm-*`,
+  and all `jones-*` crates
 - **MIT**: `jtop`, `jtop-app`, `jtop-core`
 
 Do not casually blur this boundary. If future work makes MIT `jtop*` crates depend on AGPL shared
@@ -129,6 +138,8 @@ When modifying behavior, verify with the strongest reasonable non-interactive ch
   `~/.config/azide/config.toml` and `~/.local/share/azide/`
 - `termite-config` preserves historical per-app config/data locations such as
   `~/.config/termite/config.toml` and `~/.local/share/termite/`
+- `writerm-config` uses per-app config/data locations such as
+  `~/.config/writerm/config.toml` and `~/.local/share/writerm/`
 - `termite/.worktrees/` is preserved user state, not active workspace source
 
 Preserve compatibility with user config/data paths unless there is an explicit migration plan.

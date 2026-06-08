@@ -3,6 +3,7 @@ use jones_theme as theme;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use unicode_width::UnicodeWidthChar;
 
 pub fn render_markdown(input: &str) -> Text<'static> {
     let options = Options::ENABLE_TABLES
@@ -16,6 +17,552 @@ pub fn render_markdown(input: &str) -> Text<'static> {
     let mut renderer = MarkdownRenderer::new();
     renderer.process(parser);
     renderer.finish()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRange {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub char_start: usize,
+    pub char_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedSpan {
+    pub content: String,
+    pub style: Style,
+    pub source: Option<SourceRange>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RenderedLine {
+    pub spans: Vec<RenderedSpan>,
+    pub source: Option<SourceRange>,
+}
+
+impl RenderedLine {
+    pub fn plain_text(&self) -> String {
+        self.spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RenderedDocument {
+    pub lines: Vec<RenderedLine>,
+}
+
+impl RenderedDocument {
+    pub fn to_text(&self) -> Text<'static> {
+        Text::from(
+            self.lines
+                .iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .iter()
+                            .map(|span| Span::styled(span.content.clone(), span.style))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn display_to_source(&self, row: usize, col: usize) -> Option<usize> {
+        let line = self.lines.get(row)?;
+        let mut display_col = 0usize;
+        let mut fallback = line
+            .spans
+            .iter()
+            .find_map(|span| span.source.as_ref().map(|range| range.char_start))
+            .or_else(|| line.source.as_ref().map(|range| range.char_start));
+
+        for span in &line.spans {
+            let span_width = display_width(&span.content);
+            let span_end = display_col + span_width;
+            if col <= span_end {
+                if let Some(source) = &span.source {
+                    let rel =
+                        display_col_to_char_offset(&span.content, col.saturating_sub(display_col));
+                    return Some(source.char_start + rel.min(source.char_end - source.char_start));
+                }
+                return fallback;
+            }
+            if let Some(source) = &span.source {
+                fallback = Some(source.char_end);
+            }
+            display_col = span_end;
+        }
+
+        fallback.or_else(|| line.source.as_ref().map(|range| range.char_end))
+    }
+
+    pub fn source_to_display(&self, char_pos: usize) -> Option<(usize, usize)> {
+        let mut closest: Option<(usize, usize)> = None;
+
+        for (row, line) in self.lines.iter().enumerate() {
+            let mut display_col = 0usize;
+            let mut seen_source_span = false;
+            if line.spans.is_empty()
+                && line
+                    .source
+                    .as_ref()
+                    .is_some_and(|range| (range.char_start..=range.char_end).contains(&char_pos))
+            {
+                return Some((row, 0));
+            }
+            if let Some(line_source) = &line.source
+                && char_pos < line_source.char_start
+            {
+                continue;
+            }
+            for span in &line.spans {
+                let span_width = display_width(&span.content);
+                if let Some(source) = &span.source {
+                    if char_pos < source.char_start
+                        && line
+                            .source
+                            .as_ref()
+                            .is_some_and(|range| char_pos >= range.char_start)
+                    {
+                        return Some((row, if seen_source_span { display_col } else { 0 }));
+                    }
+                    if (source.char_start..=source.char_end).contains(&char_pos) {
+                        let rel = char_pos.saturating_sub(source.char_start);
+                        return Some((
+                            row,
+                            display_col + display_width_for_chars(&span.content, rel),
+                        ));
+                    }
+                    if source.char_end <= char_pos {
+                        closest = Some((row, display_col + span_width));
+                    }
+                    seen_source_span = true;
+                }
+                display_col += span_width;
+            }
+            if let Some(line_source) = &line.source
+                && (line_source.char_start..=line_source.char_end).contains(&char_pos)
+            {
+                return Some((row, display_col));
+            }
+        }
+
+        closest
+    }
+}
+
+pub fn render_markdown_mapped(input: &str) -> RenderedDocument {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_FOOTNOTES;
+    let parser = Parser::new_ext(input, options);
+    let mut renderer = MappedMarkdownRenderer::new(input);
+    renderer.process(parser.into_offset_iter());
+    renderer.finish()
+}
+
+struct MappedMarkdownRenderer<'a> {
+    input: &'a str,
+    lines: Vec<RenderedLine>,
+    current_spans: Vec<RenderedSpan>,
+    style_stack: Vec<Style>,
+    list_stack: Vec<Option<u64>>,
+    blockquote_depth: usize,
+    in_code_block: bool,
+    in_table: bool,
+    first_table_cell: bool,
+    pending_line_source: Option<SourceRange>,
+}
+
+impl<'a> MappedMarkdownRenderer<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            lines: Vec::new(),
+            current_spans: Vec::new(),
+            style_stack: vec![Style::default().fg(theme::text_primary())],
+            list_stack: Vec::new(),
+            blockquote_depth: 0,
+            in_code_block: false,
+            in_table: false,
+            first_table_cell: true,
+            pending_line_source: None,
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        self.style_stack.last().copied().unwrap_or_default()
+    }
+
+    fn push_style(&mut self, modifier: Style) {
+        self.style_stack.push(self.current_style().patch(modifier));
+    }
+
+    fn pop_style(&mut self) {
+        if self.style_stack.len() > 1 {
+            self.style_stack.pop();
+        }
+    }
+
+    fn process<'b>(&mut self, parser: impl Iterator<Item = (Event<'b>, std::ops::Range<usize>)>) {
+        for (event, range) in parser {
+            self.handle_event(event, range);
+        }
+        if !self.current_spans.is_empty() {
+            self.finish_line();
+        }
+        if self.lines.is_empty() {
+            self.lines.push(RenderedLine::default());
+        }
+    }
+
+    fn handle_event(&mut self, event: Event<'_>, range: std::ops::Range<usize>) {
+        match event {
+            Event::Start(tag) => self.handle_start(tag, range),
+            Event::End(tag_end) => self.handle_end(tag_end),
+            Event::Text(text) => {
+                if self.in_code_block {
+                    self.push_multiline_text(&text, range, self.current_style());
+                } else {
+                    self.push_text(text.as_ref(), Some(range), self.current_style());
+                }
+            }
+            Event::Code(code) => {
+                self.push_text(
+                    code.as_ref(),
+                    Some(range),
+                    Style::default().fg(theme::code_fg()).bg(theme::code_bg()),
+                );
+            }
+            Event::SoftBreak => {
+                self.push_text(" ", Some(range), self.current_style());
+            }
+            Event::HardBreak => self.finish_line(),
+            Event::Rule => {
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.push_visual("─".repeat(32), Style::default().fg(theme::rule()));
+                self.finish_line();
+                self.lines.push(RenderedLine::default());
+            }
+            Event::TaskListMarker(checked) => {
+                self.push_visual(
+                    if checked { "[✓] " } else { "[ ] " },
+                    Style::default().fg(theme::task_marker()),
+                );
+            }
+            Event::FootnoteReference(label) => {
+                self.push_visual(
+                    format!("[{label}]"),
+                    Style::default()
+                        .fg(theme::footnote_ref())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_start(&mut self, tag: Tag<'_>, _range: std::ops::Range<usize>) {
+        match tag {
+            Tag::Heading { level, .. } => {
+                self.set_pending_line_source(_range.clone());
+                self.push_style(
+                    Style::default()
+                        .fg(heading_color(level))
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            Tag::Emphasis => self.push_style(Style::default().add_modifier(Modifier::ITALIC)),
+            Tag::Strong => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
+            Tag::Strikethrough => {
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+            }
+            Tag::Link { .. } => self.push_style(
+                Style::default()
+                    .fg(theme::link())
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Tag::CodeBlock(_) => {
+                self.set_pending_line_source(_range.clone());
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.in_code_block = true;
+                self.push_style(
+                    Style::default()
+                        .fg(theme::code_block_fg())
+                        .bg(theme::code_block_bg()),
+                );
+            }
+            Tag::BlockQuote(_) => {
+                self.blockquote_depth += 1;
+                self.push_style(Style::default().fg(theme::text_secondary()));
+            }
+            Tag::List(start) => self.list_stack.push(start),
+            Tag::Item => {
+                self.set_pending_line_source(_range.clone());
+                let depth = self.list_stack.len().saturating_sub(1);
+                let indent = "  ".repeat(depth);
+                let marker = if let Some(Some(next)) = self.list_stack.last_mut() {
+                    let marker = format!("{indent}{next}. ");
+                    *next += 1;
+                    marker
+                } else {
+                    format!("{indent}{} ", bullet_for_depth(depth))
+                };
+                self.push_visual(marker, Style::default().fg(theme::list_bullet()));
+            }
+            Tag::Table(_) => {
+                self.set_pending_line_source(_range.clone());
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.in_table = true;
+            }
+            Tag::TableRow => {
+                self.first_table_cell = true;
+            }
+            Tag::TableCell => {
+                if self.in_table && !self.first_table_cell {
+                    self.push_visual(" | ", Style::default().fg(theme::table_border()));
+                }
+                self.first_table_cell = false;
+            }
+            Tag::Paragraph => {
+                self.set_pending_line_source(_range.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn set_pending_line_source(&mut self, range: std::ops::Range<usize>) {
+        let range = self.source_range(range);
+        self.pending_line_source = Some(match self.pending_line_source.take() {
+            Some(existing) => merge_source_ranges(existing, range),
+            None => range,
+        });
+    }
+
+    fn handle_end(&mut self, tag_end: TagEnd) {
+        match tag_end {
+            TagEnd::Heading(_) => {
+                self.pop_style();
+                self.finish_line();
+                self.lines.push(RenderedLine::default());
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                self.pop_style();
+            }
+            TagEnd::CodeBlock => {
+                self.in_code_block = false;
+                self.pop_style();
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.lines.push(RenderedLine::default());
+            }
+            TagEnd::BlockQuote(_) => {
+                self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
+                self.pop_style();
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+            }
+            TagEnd::List(_) => {
+                self.list_stack.pop();
+                if self.list_stack.is_empty() && !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+            }
+            TagEnd::Item => self.finish_line(),
+            TagEnd::Paragraph => {
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                self.lines.push(RenderedLine::default());
+            }
+            TagEnd::TableRow => self.finish_line(),
+            TagEnd::Table => {
+                self.in_table = false;
+                self.lines.push(RenderedLine::default());
+            }
+            _ => {}
+        }
+    }
+
+    fn push_multiline_text(&mut self, text: &str, range: std::ops::Range<usize>, style: Style) {
+        let mut byte_cursor = range.start;
+        for (idx, part) in text.split_inclusive('\n').enumerate() {
+            if idx > 0 {
+                self.finish_line();
+            }
+            let trimmed = part.trim_end_matches('\n');
+            if !trimmed.is_empty() {
+                let end = byte_cursor + trimmed.len();
+                self.push_text(trimmed, Some(byte_cursor..end), style);
+            }
+            byte_cursor += part.len();
+        }
+    }
+
+    fn push_visual<S: Into<String>>(&mut self, content: S, style: Style) {
+        self.current_spans.push(RenderedSpan {
+            content: content.into(),
+            style,
+            source: None,
+        });
+    }
+
+    fn push_text(&mut self, content: &str, range: Option<std::ops::Range<usize>>, style: Style) {
+        if content.is_empty() {
+            return;
+        }
+        self.current_spans.push(RenderedSpan {
+            content: content.to_string(),
+            style,
+            source: range.map(|range| self.source_range(range)),
+        });
+    }
+
+    fn source_range(&self, range: std::ops::Range<usize>) -> SourceRange {
+        SourceRange {
+            byte_start: range.start,
+            byte_end: range.end,
+            char_start: self.input[..range.start].chars().count(),
+            char_end: self.input[..range.end].chars().count(),
+        }
+    }
+
+    fn finish_line(&mut self) {
+        let mut spans = std::mem::take(&mut self.current_spans);
+        if self.blockquote_depth > 0 {
+            spans.insert(
+                0,
+                RenderedSpan {
+                    content: "│ ".repeat(self.blockquote_depth),
+                    style: Style::default().fg(theme::blockquote()),
+                    source: None,
+                },
+            );
+        }
+
+        let mut source = spans
+            .iter()
+            .filter_map(|span| span.source.as_ref())
+            .cloned()
+            .chain(self.pending_line_source.take())
+            .reduce(merge_source_ranges);
+        trim_source_to_visible_span_bounds(&mut source, &spans);
+
+        self.lines.push(RenderedLine { spans, source });
+    }
+
+    fn finish(self) -> RenderedDocument {
+        let mut doc = RenderedDocument { lines: self.lines };
+        assign_blank_line_sources(&mut doc, self.input);
+        doc
+    }
+}
+
+fn merge_source_ranges(mut left: SourceRange, right: SourceRange) -> SourceRange {
+    left.byte_start = left.byte_start.min(right.byte_start);
+    left.byte_end = left.byte_end.max(right.byte_end);
+    left.char_start = left.char_start.min(right.char_start);
+    left.char_end = left.char_end.max(right.char_end);
+    left
+}
+
+fn trim_source_to_visible_span_bounds(source: &mut Option<SourceRange>, spans: &[RenderedSpan]) {
+    let Some(source) = source else {
+        return;
+    };
+    let Some(first_span) = spans.iter().find_map(|span| span.source.as_ref()) else {
+        return;
+    };
+    let Some(last_span) = spans.iter().rev().find_map(|span| span.source.as_ref()) else {
+        return;
+    };
+    source.byte_start = source.byte_start.min(first_span.byte_start);
+    source.byte_end = source.byte_end.min(last_span.byte_end);
+    source.char_start = source.char_start.min(first_span.char_start);
+    source.char_end = source.char_end.min(last_span.char_end);
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn display_width_for_chars(text: &str, char_count: usize) -> usize {
+    text.chars()
+        .take(char_count)
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn display_col_to_char_offset(text: &str, display_col: usize) -> usize {
+    let mut width = 0usize;
+    let mut chars = 0usize;
+    for ch in text.chars() {
+        let next = width + UnicodeWidthChar::width(ch).unwrap_or(0);
+        if next > display_col {
+            return chars;
+        }
+        width = next;
+        chars += 1;
+    }
+    chars
+}
+
+fn assign_blank_line_sources(doc: &mut RenderedDocument, input: &str) {
+    let mut blank_starts = physical_blank_line_char_starts(input).into_iter();
+    for line in &mut doc.lines {
+        if line.source.is_none()
+            && line.spans.is_empty()
+            && let Some(char_pos) = blank_starts.next()
+        {
+            let byte_pos = byte_offset_for_char(input, char_pos);
+            line.source = Some(SourceRange {
+                byte_start: byte_pos,
+                byte_end: byte_pos,
+                char_start: char_pos,
+                char_end: char_pos,
+            });
+        }
+    }
+}
+
+fn physical_blank_line_char_starts(input: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut char_start = 0usize;
+    for line in input.split_inclusive('\n') {
+        let without_newline = line.trim_end_matches('\n').trim_end_matches('\r');
+        if without_newline.is_empty() {
+            starts.push(char_start);
+        }
+        char_start += line.chars().count();
+    }
+    if input.ends_with('\n') {
+        starts.push(char_start);
+    }
+    starts
+}
+
+fn byte_offset_for_char(input: &str, char_pos: usize) -> usize {
+    input
+        .char_indices()
+        .nth(char_pos)
+        .map(|(idx, _)| idx)
+        .unwrap_or(input.len())
 }
 
 // ── Bullet styles per nesting depth ──────────────────────────────────
@@ -755,6 +1302,82 @@ mod tests {
         let text = render_markdown(md);
         let all_text = collect_text(&text);
         assert!(all_text.contains("[img]"));
+    }
+
+    #[test]
+    fn mapped_renderer_hides_common_markdown_markers() {
+        let doc = render_markdown_mapped(
+            "# Title\n\nSome **bold** and [link](https://example.com).\n\n- item",
+        );
+        let plain = doc
+            .lines
+            .iter()
+            .map(RenderedLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(plain.contains("Title"));
+        assert!(plain.contains("Some bold and link."));
+        assert!(plain.contains("• item"));
+        assert!(!plain.contains("# Title"));
+        assert!(!plain.contains("**bold**"));
+        assert!(!plain.contains("[link]("));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_heading_display_to_source() {
+        let doc = render_markdown_mapped("# Hello");
+
+        assert_eq!(doc.display_to_source(0, 0), Some(2));
+        assert_eq!(doc.display_to_source(0, 4), Some(6));
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        assert_eq!(doc.source_to_display(1), Some((0, 0)));
+        assert_eq!(doc.source_to_display(2), Some((0, 0)));
+        assert_eq!(doc.source_to_display(7), Some((0, 5)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_list_visual_prefix_to_item_text() {
+        let doc = render_markdown_mapped("- item\n- next");
+
+        assert_eq!(doc.display_to_source(0, 0), Some(2));
+        assert_eq!(doc.display_to_source(0, 2), Some(2));
+        assert_eq!(doc.display_to_source(0, 5), Some(5));
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        assert_eq!(doc.source_to_display(1), Some((0, 0)));
+        assert_eq!(doc.source_to_display(2), Some((0, 2)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_empty_lines_conservatively() {
+        let doc = render_markdown_mapped("a\n\nb");
+        assert!(doc.lines.iter().any(|line| line.plain_text().is_empty()));
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(1, 0), Some(2));
+        assert_eq!(doc.source_to_display(2), Some((1, 0)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_hidden_inline_markers_to_visible_boundaries() {
+        let doc = render_markdown_mapped("**bold** and [link](https://example.com)");
+
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        assert_eq!(doc.source_to_display(1), Some((0, 0)));
+        assert_eq!(doc.source_to_display(2), Some((0, 0)));
+        assert_eq!(doc.source_to_display(7), Some((0, 4)));
+        assert_eq!(doc.source_to_display(8), Some((0, 4)));
+        assert_eq!(doc.display_to_source(0, 11), Some(16));
+    }
+
+    #[test]
+    fn mapped_renderer_uses_terminal_cell_width_for_columns() {
+        let doc = render_markdown_mapped("a界b");
+
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(0, 1), Some(1));
+        assert_eq!(doc.display_to_source(0, 2), Some(1));
+        assert_eq!(doc.display_to_source(0, 3), Some(2));
+        assert_eq!(doc.source_to_display(2), Some((0, 3)));
     }
 
     #[test]

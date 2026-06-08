@@ -1,0 +1,23 @@
+[package]
+name = "writerm-app"
+version = "0.1.0"
+edition = "2024"
+description = "Writerm full-screen terminal Markdown writing app"
+license = "AGPL-3.0"
+authors = ["Geosmin Jones"]
+
+[dependencies]
+jones-editor = { path = "../jones-editor" }
+jones-event = { path = "../jones-event" }
+jones-outline = { path = "../jones-outline" }
+jones-render = { path = "../jones-render" }
+jones-terminal = { path = "../jones-terminal" }
+jones-theme = { path = "../jones-theme" }
+jones-workspace = { path = "../jones-workspace" }
+writerm-config = { path = "../writerm-config" }
+ratatui.workspace = true
+crossterm.workspace = true
+color-eyre.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

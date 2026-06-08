@@ -1,0 +1,13 @@
+[package]
+name = "jones-editor"
+version = "0.1.0"
+edition = "2024"
+description = "Shared editor state and key handling for Jones Suite terminal apps"
+license = "AGPL-3.0"
+authors = ["Geosmin Jones"]
+
+[dependencies]
+jones-text = { path = "../jones-text" }
+crossterm.workspace = true
+color-eyre.workspace = true
+arboard = "3.4"

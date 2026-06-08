@@ -2724,6 +2724,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jones-editor"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "color-eyre",
+ "crossterm",
+ "jones-text",
+]
+
+[[package]]
 name = "jones-event"
 version = "0.1.0"
 dependencies = [
@@ -2758,6 +2768,7 @@ dependencies = [
  "jones-theme",
  "pulldown-cmark",
  "ratatui",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -4988,10 +4999,8 @@ dependencies = [
 name = "termite-editor"
 version = "0.2.1"
 dependencies = [
- "arboard",
- "color-eyre",
  "crossterm",
- "jones-text",
+ "jones-editor",
 ]
 
 [[package]]
@@ -6695,6 +6704,42 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "writerm"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "tokio",
+ "writerm-app",
+]
+
+[[package]]
+name = "writerm-app"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "crossterm",
+ "jones-editor",
+ "jones-event",
+ "jones-outline",
+ "jones-render",
+ "jones-terminal",
+ "jones-theme",
+ "jones-workspace",
+ "ratatui",
+ "tempfile",
+ "writerm-config",
+]
+
+[[package]]
+name = "writerm-config"
+version = "0.1.0"
+dependencies = [
+ "jones-config",
+ "serde",
+ "tempfile",
+]
 
 [[package]]
 name = "x11-dl"
