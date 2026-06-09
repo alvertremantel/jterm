@@ -1,6 +1,31 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = [
+    "crates/jones-config",
+    "crates/jones-editor",
+    "crates/jones-event",
+    "crates/jones-outline",
+    "crates/jones-project-search",
+    "crates/jones-render",
+    "crates/jones-search",
+    "crates/jones-state",
+    "crates/jones-syntax",
+    "crates/jones-terminal",
+    "crates/jones-text",
+    "crates/jones-theme",
+    "crates/jones-tui",
+    "crates/jones-workspace",
+    "crates/termex",
+    "crates/termex-app",
+    "crates/termex-config",
+    "crates/termite",
+    "crates/termite-app",
+    "crates/termite-config",
+    "crates/termite-editor",
+    "crates/writerm",
+    "crates/writerm-app",
+    "crates/writerm-config",
+]
 exclude = ["termite/.worktrees/*"]
 
 [workspace.package]

@@ -1,48 +1,35 @@
 # J-SUITE GUIDANCE - version 1
 
 J-Suite is the integrated Rust workspace for the Jones Suite tools. Treat the root workspace as
-authoritative and treat the suite as four applications built from many small, shared crates.
+authoritative and treat the suite as three applications built from many small, shared crates.
 
 ## Workspace authority and layout
 
-- Root workspace: `/home/jones/dev/tools/j-suite/Cargo.toml`
-- Workspace membership: `members = ["crates/*"]`
-- Active crate root: `/home/jones/dev/tools/j-suite/crates/`
+- Root workspace: `/home/jones/dev/tools/termite/Cargo.toml`
+- Workspace membership: explicit allowlist in `members = [...]`
+- Active crate root: `/home/jones/dev/tools/termite/crates/`
 - Preserved exclusion: `termite/.worktrees/*` is intentionally excluded from workspace membership
 
 ### Authoritative source tree
 
 - `crates/` — all active workspace member crates, including binaries and shared libraries
-- top-level `azide/`, `termite/`, `jtop/` — legacy/pre-migration directories; do **not** treat
-  them as the active source of truth
+- `termite/.worktrees/` — preserved user worktrees/state; do **not** treat them as workspace crates
 
-If a code/config/docs discrepancy exists between `crates/` and a preserved legacy directory,
-`crates/` wins.
+If code/config/docs disagree with the active crates under `crates/`, the `crates/` tree wins.
 
 ## Application map
 
-There are four end-user applications:
+There are three end-user applications:
 
-- **azide** — RSS/Atom reader with Ratatui TUI plus feed-management CLI behavior
 - **termite** — terminal text reader/editor with workspace navigation and search tools
+- **termex** — single-document terminal reader/writer
 - **writerm** — full-screen terminal Markdown writing app with rendered editing
-- **jtop** — laptop power-management monitor/manager TUI
 
 ### Binary crates
 
-- `azide`
 - `termite`
+- `termex`
 - `writerm`
-- `jtop`
-
-### Azide crates
-
-- `azide-app` — Azide TUI/app logic
-- `azide-cli` — Azide command-line command handling
-- `azide-config` — Azide config loading/saving and app-specific defaults
-- `azide-explore` — curated/default feed exploration support
-- `azide-feed` — RSS/Atom parsing and feed-level data handling
-- `azide-store` — persisted feed/article storage
 
 ### Termite crates
 
@@ -50,15 +37,15 @@ There are four end-user applications:
 - `termite-config` — Termite config loading/saving and defaults
 - `termite-editor` — compatibility re-export for shared editor behavior
 
+### Termex crates
+
+- `termex-app` — Termex application/event-loop/TUI coordination
+- `termex-config` — Termex config loading/saving and defaults
+
 ### Writerm crates
 
 - `writerm-app` — Writerm application/event-loop/TUI coordination
 - `writerm-config` — Writerm config loading/saving and defaults
-
-### Jtop crates
-
-- `jtop-app` — Jtop TUI/app-state logic
-- `jtop-core` — power-management domain logic, runners, parsers, privilege policy, etc.
 
 ### Shared Jones crates
 
@@ -82,7 +69,7 @@ There are four end-user applications:
 - Prefer **small, sharply scoped crates** over growing app crates into monoliths.
 - Shared behavior that is not app-specific should migrate toward `jones-*` crates.
 - App crates should compose domain/shared crates rather than duplicate their logic.
-- Avoid reintroducing dependencies on preserved top-level legacy directories.
+- Avoid reintroducing dependencies on preserved non-workspace directories.
 - Keep root workspace dependency policy coherent; prefer shared versions in
   `[workspace.dependencies]` where sensible.
 
@@ -98,14 +85,9 @@ Only add crate-local versions when the dependency is truly crate-specific.
 
 ## Licensing nuance
 
-Licensing is intentionally **not** unified across the whole suite.
-
-- **AGPL**: `azide`, `termite`, `writerm`, all `azide-*`, all `termite-*`, all `writerm-*`,
-  and all `jones-*` crates
-- **MIT**: `jtop`, `jtop-app`, `jtop-core`
-
-Do not casually blur this boundary. If future work makes MIT `jtop*` crates depend on AGPL shared
-crates, that is a real project-level licensing decision and should be surfaced explicitly.
+The active workspace in this repository is AGPL-licensed across the retained application crates
+and the shared `jones-*` crates. Keep crate manifests and contributor guidance aligned with that
+active workspace scope.
 
 ## Testing and verification policy
 
@@ -113,9 +95,6 @@ CI/local verification should **not** depend on:
 
 - live network access
 - interactive TUI sessions
-- real batteries
-- `sudo` prompts
-- `tlp`, `powertop`, or other host-specific tools being available
 
 Prefer:
 
@@ -123,7 +102,6 @@ Prefer:
 - integration tests with fakes/fixtures
 - tempdirs
 - smoke-check-only CLI help where safe
-- pure policy/parsing tests around system integrations
 
 When modifying behavior, verify with the strongest reasonable non-interactive checks first:
 
@@ -134,8 +112,8 @@ When modifying behavior, verify with the strongest reasonable non-interactive ch
 
 ## Runtime/config nuance
 
-- `azide-config` preserves historical per-app config/data locations such as
-  `~/.config/azide/config.toml` and `~/.local/share/azide/`
+- `termex-config` preserves per-app config/data locations such as
+  `~/.config/termex/config.toml` and `~/.local/share/termex/`
 - `termite-config` preserves historical per-app config/data locations such as
   `~/.config/termite/config.toml` and `~/.local/share/termite/`
 - `writerm-config` uses per-app config/data locations such as
@@ -166,6 +144,6 @@ Preserve compatibility with user config/data paths unless there is an explicit m
 
 ## Practical summary
 
-The big migration already happened. The root workspace and `crates/` tree are the product. Work
-from there, preserve noninteractive verification, respect the license split, and keep pushing the
-suite toward reusable shared crates instead of app-local duplication.
+The root workspace and `crates/` tree are the product. Work from there, preserve noninteractive
+verification, and keep pushing the suite toward reusable shared crates instead of app-local
+duplication.

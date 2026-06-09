@@ -1,9 +1,0 @@
-[package]
-name = "jtop-core"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-nix = { version = "0.31", features = ["user"] }
-tempfile.workspace = true

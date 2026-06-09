@@ -1,9 +1,0 @@
-[package]
-name = "azide-explore"
-version = "0.2.1"
-edition = "2024"
-license = "AGPL-3.0"
-
-[dependencies]
-serde.workspace = true
-toml.workspace = true

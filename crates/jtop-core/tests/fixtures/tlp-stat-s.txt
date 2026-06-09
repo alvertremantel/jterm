@@ -1,7 +1,0 @@
-System = ThinkPad X1 Carbon
-BIOS = N3AET73W (1.49 )
-
-TLP power save = enabled
-Power source = battery
-
-Mode = battery
