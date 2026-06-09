@@ -169,6 +169,8 @@ impl WritermApp {
             }
             KeyCode::Char('m') if ctrl => {
                 self.source_peek = !self.source_peek;
+                self.desired_display_col = None;
+                self.ensure_cursor_visible();
                 self.notification = Some((
                     if self.source_peek {
                         "Source peek on".into()
@@ -186,17 +188,32 @@ impl WritermApp {
                 self.prompt_buffer.clear();
             }
             KeyCode::PageUp => {
-                self.desired_display_col = None;
-                self.document_scroll = self
-                    .document_scroll
-                    .saturating_sub(self.document_area.height.max(1) as usize);
+                self.move_visual_page(-1, shift);
             }
             KeyCode::PageDown => {
-                self.desired_display_col = None;
-                self.document_scroll += self.document_area.height.max(1) as usize;
+                self.move_visual_page(1, shift);
+            }
+            KeyCode::Left if !self.source_peek && ctrl && !alt => {
+                self.move_visual_word(-1, shift);
+            }
+            KeyCode::Right if !self.source_peek && ctrl && !alt => {
+                self.move_visual_word(1, shift);
+            }
+            KeyCode::Left if !self.source_peek && !ctrl && !alt => {
+                self.move_visual_horizontal(-1, shift);
+            }
+            KeyCode::Right if !self.source_peek && !ctrl && !alt => {
+                self.move_visual_horizontal(1, shift);
+            }
+            KeyCode::Home if !self.source_peek && !ctrl && !alt => {
+                self.move_visual_line_boundary(false, shift);
+            }
+            KeyCode::End if !self.source_peek && !ctrl && !alt => {
+                self.move_visual_line_boundary(true, shift);
             }
             KeyCode::Up if !ctrl && !alt => self.move_visual_vertical(-1, shift),
             KeyCode::Down if !ctrl && !alt => self.move_visual_vertical(1, shift),
+            KeyCode::Up | KeyCode::Down if !self.source_peek && (ctrl || alt) => {}
             _ => self.handle_editor_key(key),
         }
     }
@@ -304,12 +321,10 @@ impl WritermApp {
                 self.drag_selecting = false;
             }
             MouseEventKind::ScrollUp => {
-                self.desired_display_col = None;
-                self.document_scroll = self.document_scroll.saturating_sub(3);
+                self.scroll_document(-3);
             }
             MouseEventKind::ScrollDown => {
-                self.desired_display_col = None;
-                self.document_scroll = self.document_scroll.saturating_add(3);
+                self.scroll_document(3);
             }
             _ => {}
         }
@@ -418,6 +433,8 @@ impl WritermApp {
         self.current_file_path = path;
         self.editor = EditorContext::from_content(&content);
         self.document_scroll = 0;
+        self.heading_scroll = 0;
+        self.desired_display_col = None;
         self.source_peek = !is_markdown_path(&self.current_file_path);
         self.refresh_workspace();
         self.refresh_document_metadata();
@@ -426,17 +443,130 @@ impl WritermApp {
         true
     }
 
+    fn move_visual_page(&mut self, delta: isize, extend_selection: bool) {
+        let jump = self.document_area.height.max(1) as isize;
+        self.move_visual_rows(delta.saturating_mul(jump), extend_selection, true);
+    }
+
     fn move_visual_vertical(&mut self, delta: isize, extend_selection: bool) {
+        self.move_visual_rows(delta, extend_selection, false);
+    }
+
+    fn move_visual_horizontal(&mut self, delta: isize, extend_selection: bool) {
+        self.refresh_render_cache();
+        let visual = self.visual_document();
+        let current = self.editor.cursor_char_pos();
+        let Some((row, col)) = visual.source_to_display(current) else {
+            return;
+        };
+        let target = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                if col > 0 {
+                    visual.display_to_source(row, col - 1)
+                } else {
+                    row.checked_sub(1)
+                        .and_then(|row| visual.display_to_source(row, usize::MAX))
+                }
+            }
+            std::cmp::Ordering::Equal => Some(current),
+            std::cmp::Ordering::Greater => {
+                let visible_at_cursor = visual.display_to_source(row, col);
+                if let Some(source) = visible_at_cursor
+                    && current < source
+                {
+                    Some(source)
+                } else {
+                    visual.display_to_source(row, col + 1).or_else(|| {
+                        (row + 1 < visual.rows.len())
+                            .then(|| search_mapped_rows_forward(&visual, row + 1, 0))?
+                    })
+                }
+            }
+        };
+        let Some(char_pos) = target else {
+            return;
+        };
+        self.move_visual_cursor_to(char_pos, extend_selection);
+        self.desired_display_col = None;
+        self.ensure_cursor_visible();
+    }
+
+    fn move_visual_word(&mut self, delta: isize, extend_selection: bool) {
+        self.refresh_render_cache();
+        let visual = self.visual_document();
+        let current = self.editor.cursor_char_pos();
+        let Some((row, col)) = visual.source_to_display(current) else {
+            return;
+        };
+        let target = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                visual_word_boundary_left(&visual, row, col).unwrap_or(current)
+            }
+            std::cmp::Ordering::Equal => current,
+            std::cmp::Ordering::Greater => {
+                visual_word_boundary_right(&visual, row, col).unwrap_or(current)
+            }
+        };
+        if target == current {
+            return;
+        }
+
+        self.move_visual_cursor_to(target, extend_selection);
+        self.desired_display_col = None;
+        self.ensure_cursor_visible();
+    }
+
+    fn move_visual_line_boundary(&mut self, end: bool, extend_selection: bool) {
+        self.refresh_render_cache();
+        let visual = self.visual_document();
+        let current = self.editor.cursor_char_pos();
+        let Some((row, _)) = visual.source_to_display(current) else {
+            return;
+        };
+        let col = if end {
+            visual.row_width(row).unwrap_or_default()
+        } else {
+            0
+        };
+        let Some(char_pos) = visual.display_to_source(row, col) else {
+            return;
+        };
+        self.move_visual_cursor_to(char_pos, extend_selection);
+        self.desired_display_col = None;
+        self.ensure_cursor_visible();
+    }
+
+    fn move_visual_rows(&mut self, delta: isize, extend_selection: bool, clamp: bool) {
         self.refresh_render_cache();
         let visual = self.visual_document();
         let Some((row, col)) = visual.source_to_display(self.editor.cursor_char_pos()) else {
             return;
         };
+        if visual.rows.is_empty() {
+            return;
+        }
         let target_col = self.desired_display_col.unwrap_or(col);
-        let target_row = if delta < 0 {
-            row.checked_sub(delta.unsigned_abs())
-        } else {
-            Some(row.saturating_add(delta as usize))
+        let clamped_to_boundary = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => clamp && row.checked_sub(delta.unsigned_abs()).is_none(),
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Greater => {
+                clamp && row.saturating_add(delta as usize) >= visual.rows.len().saturating_sub(1)
+            }
+        };
+        let target_row = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                let target = row.checked_sub(delta.unsigned_abs());
+                if clamp { target.or(Some(0)) } else { target }
+            }
+            std::cmp::Ordering::Equal => Some(row),
+            std::cmp::Ordering::Greater => {
+                let target = row.saturating_add(delta as usize);
+                if clamp {
+                    Some(target.min(visual.rows.len().saturating_sub(1)))
+                } else {
+                    Some(target)
+                }
+            }
         };
         let Some(target_row) = target_row else {
             return;
@@ -444,10 +574,22 @@ impl WritermApp {
         if target_row >= visual.rows.len() {
             return;
         }
-        let Some(char_pos) = visual.display_to_source(target_row, target_col) else {
+        let Some(char_pos) = mapped_char_near_visual_row(
+            &visual,
+            target_row,
+            target_col,
+            delta,
+            clamped_to_boundary,
+        ) else {
             return;
         };
 
+        self.move_visual_cursor_to(char_pos, extend_selection);
+        self.desired_display_col = Some(target_col);
+        self.ensure_cursor_visible();
+    }
+
+    fn move_visual_cursor_to(&mut self, char_pos: usize, extend_selection: bool) {
         if extend_selection {
             if self.editor.state.selection.is_none() {
                 self.editor.state.start_selection();
@@ -458,8 +600,6 @@ impl WritermApp {
             self.editor.state.clear_selection();
             self.editor.move_cursor_to_char_pos(char_pos);
         }
-        self.desired_display_col = Some(target_col);
-        self.ensure_cursor_visible();
     }
 
     pub fn change_cwd(&mut self, path: PathBuf) {
@@ -520,6 +660,26 @@ impl WritermApp {
         }
     }
 
+    fn scroll_document(&mut self, delta: isize) {
+        self.desired_display_col = None;
+        self.document_scroll = if delta < 0 {
+            self.document_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.document_scroll.saturating_add(delta as usize)
+        };
+        self.clamp_document_scroll();
+    }
+
+    pub fn clamp_document_scroll(&mut self) {
+        self.refresh_render_cache();
+        let visual = self.visual_document();
+        let max_scroll = visual
+            .rows
+            .len()
+            .saturating_sub(self.document_area.height.max(1) as usize);
+        self.document_scroll = self.document_scroll.min(max_scroll);
+    }
+
     pub(crate) fn visual_document(&self) -> crate::visual::VisualDocument {
         let width = self.document_area.width.max(1) as usize;
         if self.source_peek {
@@ -532,6 +692,137 @@ impl WritermApp {
             crate::visual::VisualDocument::from_rendered(&self.rendered, width)
         }
     }
+}
+
+fn mapped_char_near_visual_row(
+    visual: &crate::visual::VisualDocument,
+    target_row: usize,
+    target_col: usize,
+    delta: isize,
+    clamped_to_boundary: bool,
+) -> Option<usize> {
+    if let Some(char_pos) = visual.display_to_source(target_row, target_col) {
+        return Some(char_pos);
+    }
+
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => search_mapped_rows_backward(visual, target_row, target_col)
+            .or_else(|| {
+                clamped_to_boundary
+                    .then(|| search_mapped_rows_forward(visual, target_row, target_col))
+                    .flatten()
+            }),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => search_mapped_rows_forward(visual, target_row, target_col)
+            .or_else(|| {
+                clamped_to_boundary
+                    .then(|| search_mapped_rows_backward(visual, target_row, target_col))
+                    .flatten()
+            }),
+    }
+}
+
+fn visual_word_boundary_right(
+    visual: &crate::visual::VisualDocument,
+    start_row: usize,
+    start_col: usize,
+) -> Option<usize> {
+    let (mut row, mut col) = (start_row, start_col);
+    while let Some((next_row, next_col)) = next_visual_cell(visual, row, col) {
+        if !visual.is_word_at_display_col(row, col) {
+            break;
+        }
+        row = next_row;
+        col = next_col;
+    }
+    while let Some((next_row, next_col)) = next_visual_cell(visual, row, col) {
+        if visual.is_word_at_display_col(row, col) {
+            break;
+        }
+        row = next_row;
+        col = next_col;
+    }
+    visual.display_to_source(row, col)
+}
+
+fn visual_word_boundary_left(
+    visual: &crate::visual::VisualDocument,
+    start_row: usize,
+    start_col: usize,
+) -> Option<usize> {
+    let (mut row, mut col) = previous_visual_cell(visual, start_row, start_col)?;
+    while !visual.is_word_at_display_col(row, col) {
+        let Some((prev_row, prev_col)) = previous_visual_cell(visual, row, col) else {
+            return visual.display_to_source(row, col);
+        };
+        row = prev_row;
+        col = prev_col;
+    }
+    while let Some((prev_row, prev_col)) = previous_visual_cell(visual, row, col) {
+        if visual.is_word_at_display_col(prev_row, prev_col) {
+            row = prev_row;
+            col = prev_col;
+        } else {
+            break;
+        }
+    }
+    visual.display_to_source(row, col)
+}
+
+fn next_visual_cell(
+    visual: &crate::visual::VisualDocument,
+    row: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    let row_width = visual.row_width(row)?;
+    if col < row_width {
+        return Some((row, col + 1));
+    }
+    let mut next_row = row + 1;
+    while next_row < visual.rows.len() {
+        if visual.display_to_source(next_row, 0).is_some() {
+            return Some((next_row, 0));
+        }
+        next_row += 1;
+    }
+    None
+}
+
+fn previous_visual_cell(
+    visual: &crate::visual::VisualDocument,
+    row: usize,
+    col: usize,
+) -> Option<(usize, usize)> {
+    if col > 0 {
+        return Some((row, col - 1));
+    }
+    let mut previous_row = row.checked_sub(1)?;
+    loop {
+        if let Some(width) = visual.row_width(previous_row)
+            && visual.display_to_source(previous_row, width).is_some()
+        {
+            return Some((previous_row, width));
+        }
+        previous_row = previous_row.checked_sub(1)?;
+    }
+}
+
+fn search_mapped_rows_forward(
+    visual: &crate::visual::VisualDocument,
+    start_row: usize,
+    target_col: usize,
+) -> Option<usize> {
+    (start_row..visual.rows.len()).find_map(|row| visual.display_to_source(row, target_col))
+}
+
+fn search_mapped_rows_backward(
+    visual: &crate::visual::VisualDocument,
+    start_row: usize,
+    target_col: usize,
+) -> Option<usize> {
+    (0..=start_row)
+        .rev()
+        .find_map(|row| visual.display_to_source(row, target_col))
 }
 
 fn resolve_launch_target(maybe_path: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
@@ -844,6 +1135,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_dirty_save_blocks_open_and_preserves_document_state() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "alpha beta gamma").unwrap();
+        std::fs::write(&b, "other").unwrap();
+        let mut app = app_at(a.clone());
+        app.document_area = Rect::new(0, 0, 10, 1);
+        app.editor.move_cursor_to_char_pos(5);
+        app.editor.state.start_selection();
+        app.editor.move_cursor_to_char_pos(11);
+        app.editor.state.extend_selection();
+        app.document_scroll = 1;
+        app.editor.buffer.insert_str(16, "!");
+        app.current_file_path = dir.path().join("missing").join("a.md");
+        std::fs::write(dir.path().join("missing"), "not a dir").unwrap();
+
+        assert!(!app.open_or_create_file(&b));
+
+        assert_eq!(
+            app.current_file_path,
+            dir.path().join("missing").join("a.md")
+        );
+        assert_eq!(app.editor.text(), "alpha beta gamma!");
+        assert!(app.editor.is_dirty());
+        assert_eq!(app.editor.cursor_char_pos(), 11);
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((5, 11))
+        );
+        assert_eq!(app.document_scroll, 1);
+        assert_eq!(app.heading_scroll, 0);
+        assert!(!app.source_peek);
+        assert!(
+            app.notification
+                .as_ref()
+                .is_some_and(|(_, _, is_error)| *is_error)
+        );
+    }
+
+    #[test]
     fn autosave_failure_sets_redraw_and_backs_off_retry() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("note.md");
@@ -978,6 +1312,21 @@ mod tests {
     }
 
     #[test]
+    fn modified_vertical_keys_do_not_fall_back_to_raw_source_movement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one two three four\nnext").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 8, 4);
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), 2);
+        assert!(app.editor.state.selection.is_none());
+    }
+
+    #[test]
     fn shifted_visual_down_extends_selection_on_wrapped_rows() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("note.md");
@@ -990,6 +1339,280 @@ mod tests {
 
         let rope = app.editor.buffer.rope();
         assert_eq!(app.editor.state.selected_char_range(rope), Some((1, 12)));
+    }
+
+    #[test]
+    fn rendered_right_arrow_skips_hidden_heading_markers_without_looking_stuck() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.editor.move_cursor_to_char_pos(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 2);
+        assert_eq!(app.visual_document().source_to_display(2), Some((0, 0)));
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 3);
+        assert_eq!(app.visual_document().source_to_display(3), Some((0, 1)));
+    }
+
+    #[test]
+    fn rendered_ctrl_right_moves_by_visible_word_not_hidden_heading_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), 9);
+        assert!(app.editor.state.selection.is_none());
+    }
+
+    #[test]
+    fn rendered_ctrl_right_skips_hidden_link_url() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        let text = "[link](https://x.test) next";
+        std::fs::write(&path, text).unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 40, 4);
+        let next_start = text.find("next").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), next_start);
+        assert_eq!(
+            app.visual_document().source_to_display(next_start),
+            Some((0, 5))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), text.chars().count());
+    }
+
+    #[test]
+    fn rendered_ctrl_right_skips_hidden_bold_markers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        let text = "**bold** next";
+        std::fs::write(&path, text).unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 40, 4);
+        let next_start = text.find("next").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), next_start);
+        assert_eq!(
+            app.visual_document().source_to_display(next_start),
+            Some((0, 5))
+        );
+    }
+
+    #[test]
+    fn rendered_ctrl_right_skips_hidden_inline_code_markers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        let text = "`code` next";
+        std::fs::write(&path, text).unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 40, 4);
+        let next_start = text.find("next").unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.cursor_char_pos(), next_start);
+        assert_eq!(
+            app.visual_document().source_to_display(next_start),
+            Some((0, 5))
+        );
+    }
+
+    #[test]
+    fn rendered_ctrl_shift_right_selects_visible_word_not_hidden_heading_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.editor.cursor_char_pos(), 9);
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((0, 9))
+        );
+        assert_eq!(app.visual_document().source_to_display(9), Some((0, 7)));
+    }
+
+    #[test]
+    fn rendered_ctrl_shift_left_selects_visible_word_from_heading_end() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.editor.move_cursor_to_char_pos(9);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.editor.cursor_char_pos(), 2);
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((2, 9))
+        );
+    }
+
+    #[test]
+    fn source_peek_right_arrow_uses_raw_source_positions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.source_peek = true;
+        app.editor.move_cursor_to_char_pos(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 1);
+    }
+
+    #[test]
+    fn source_peek_ctrl_shift_right_extends_word_selection() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello world").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.source_peek = true;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.editor.cursor_char_pos(), 6);
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((0, 6))
+        );
+        assert_eq!(app.document_scroll, 0);
+    }
+
+    #[test]
+    fn source_peek_ctrl_shift_left_extends_word_selection() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello world").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.source_peek = true;
+        app.editor.move_cursor_to_char_pos(11);
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.editor.cursor_char_pos(), 6);
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn source_peek_shift_home_end_extend_source_line_selection() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello world").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 4);
+        app.source_peek = true;
+        app.editor.move_cursor_to_char_pos(6);
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((0, 6))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.editor.move_cursor_to_char_pos(6);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn rendered_home_end_move_to_wrapped_visual_row_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 4);
+        app.editor.move_cursor_to_char_pos(13);
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 11);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 16);
+    }
+
+    #[test]
+    fn shifted_rendered_home_extends_selection_to_visual_row_start() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 4);
+        app.editor.move_cursor_to_char_pos(13);
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((11, 13))
+        );
     }
 
     #[test]
@@ -1006,6 +1629,20 @@ mod tests {
     }
 
     #[test]
+    fn rendered_click_with_document_scroll_maps_offset_row() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 2);
+        app.document_scroll = 1;
+
+        app.click_document(1, 0, false);
+
+        assert_eq!(app.editor.cursor_char_pos(), 12);
+    }
+
+    #[test]
     fn cursor_visibility_uses_wrapped_visual_rows() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("note.md");
@@ -1017,6 +1654,229 @@ mod tests {
         app.ensure_cursor_visible();
 
         assert_eq!(app.document_scroll, 1);
+    }
+
+    #[test]
+    fn cursor_on_table_delimiter_stays_visible_at_body_transition() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "| A |\n|---|\n| B |").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 1);
+        app.editor.move_cursor_to_char_pos(6);
+
+        app.ensure_cursor_visible();
+
+        assert_eq!(app.visual_document().source_to_display(6), Some((1, 0)));
+        assert_eq!(app.document_scroll, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 2);
+        assert_eq!(app.document_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_scroll_down_clamps_to_available_visual_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 1);
+
+        for _ in 0..5 {
+            app.handle_event(AppEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+
+        let max_scroll = app
+            .visual_document()
+            .rows
+            .len()
+            .saturating_sub(app.document_area.height as usize);
+        assert_eq!(app.document_scroll, max_scroll);
+    }
+
+    #[test]
+    fn page_down_moves_cursor_by_visual_rows_and_scrolls_to_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 2);
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.visual_document().source_to_display(19), Some((2, 2)));
+        assert_eq!(app.editor.cursor_char_pos(), 19);
+        assert_eq!(app.document_scroll, 1);
+    }
+
+    #[test]
+    fn page_up_down_clamp_to_visual_document_bounds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 20);
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 13);
+        assert_eq!(app.document_scroll, 0);
+    }
+
+    #[test]
+    fn page_down_skips_unmapped_rendered_spacer_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading\n\nbody").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 1);
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 10);
+        assert_eq!(app.visual_document().source_to_display(10), Some((1, 0)));
+        assert_eq!(app.document_scroll, 1);
+    }
+
+    #[test]
+    fn page_up_moves_cursor_by_visual_rows_from_scrolled_position() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 2);
+        app.editor.move_cursor_to_char_pos(31);
+        app.ensure_cursor_visible();
+        assert_eq!(app.visual_document().source_to_display(31), Some((4, 0)));
+        assert_eq!(app.document_scroll, 3);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 17);
+        assert_eq!(app.document_scroll, 2);
+    }
+
+    #[test]
+    fn shifted_page_down_extends_selection_by_visual_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 2);
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((2, 19))
+        );
+    }
+
+    #[test]
+    fn shifted_page_up_extends_selection_by_visual_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 2);
+        app.editor.move_cursor_to_char_pos(31);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            app.editor
+                .state
+                .selected_char_range(app.editor.buffer.rope()),
+            Some((17, 31))
+        );
+    }
+
+    #[test]
+    fn ctrl_m_remaps_current_cursor_and_scroll_without_losing_position() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading\n\nalpha beta gamma delta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 10, 1);
+        app.editor.move_cursor_to_char_pos(12);
+        app.document_scroll = 3;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
+
+        assert!(app.source_peek);
+        assert_eq!(app.editor.cursor_char_pos(), 12);
+        assert_eq!(app.visual_document().source_to_display(12), Some((2, 1)));
+        assert_eq!(app.document_scroll, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 23);
+    }
+
+    #[test]
+    fn switching_documents_resets_preserved_visual_column() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "abcdefgh ij klmnopqr").unwrap();
+        std::fs::write(&b, "one two three four").unwrap();
+        let mut app = app_at(a);
+        app.document_area = Rect::new(0, 0, 8, 4);
+        app.editor.move_cursor_to_char_pos(6);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.editor.cursor_char_pos(), 11);
+
+        assert!(app.open_or_create_file(&b));
+        app.document_area = Rect::new(0, 0, 8, 4);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(app.editor.cursor_char_pos(), 8);
+    }
+
+    #[test]
+    fn opening_document_resets_scroll_cursor_selection_heading_scroll_and_render_mode() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "source text").unwrap();
+        std::fs::write(&b, "# Heading\n\nbody").unwrap();
+        let mut app = app_at(a);
+        app.document_area = Rect::new(0, 0, 10, 1);
+        app.document_scroll = 4;
+        app.heading_scroll = 2;
+        app.editor.move_cursor_to_char_pos(1);
+        app.editor.state.start_selection();
+        app.editor.move_cursor_to_char_pos(6);
+        app.editor.state.extend_selection();
+        assert!(app.source_peek);
+
+        assert!(app.open_or_create_file(&b));
+
+        assert_eq!(app.editor.cursor_char_pos(), 0);
+        assert!(app.editor.state.selection.is_none());
+        assert!(!app.editor.is_dirty());
+        assert_eq!(app.document_scroll, 0);
+        assert_eq!(app.heading_scroll, 0);
+        assert!(!app.source_peek);
+        assert_eq!(app.outline_entries.len(), 1);
+        assert_eq!(app.outline_entries[0].label, "Heading");
     }
 
     #[test]

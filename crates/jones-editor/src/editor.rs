@@ -312,6 +312,18 @@ impl EditorContext {
                 }
             }
 
+            // ── Word-select: Ctrl+Shift+Left/Right ─────────────────
+            KeyCode::Left if ctrl && shift => {
+                let pos = self.cursor_char_pos();
+                let target = self.word_boundary_left(pos);
+                self.move_to_char_pos_with_selection(target);
+            }
+            KeyCode::Right if ctrl && shift => {
+                let pos = self.cursor_char_pos();
+                let target = self.word_boundary_right(pos);
+                self.move_to_char_pos_with_selection(target);
+            }
+
             // ── Word-jump: Ctrl+Left ────────────────────────────────
             KeyCode::Left if ctrl => {
                 self.state.clear_selection();
@@ -362,6 +374,8 @@ impl EditorContext {
             KeyCode::Down if shift => self.move_with_selection(Direction::Down),
             KeyCode::Left if shift => self.move_with_selection(Direction::Left),
             KeyCode::Right if shift => self.move_with_selection(Direction::Right),
+            KeyCode::Home if shift => self.home_with_selection(),
+            KeyCode::End if shift => self.end_with_selection(),
 
             // ── Cursor movement ─────────────────────────────────────
             KeyCode::Up => self.move_plain(Direction::Up),
@@ -1060,6 +1074,31 @@ impl EditorContext {
         self.state.extend_selection();
     }
 
+    fn move_to_char_pos_with_selection(&mut self, char_pos: usize) {
+        if self.state.selection.is_none() {
+            self.state.start_selection();
+        }
+        self.move_cursor_to_char_pos(char_pos);
+        self.state.extend_selection();
+    }
+
+    fn home_with_selection(&mut self) {
+        if self.state.selection.is_none() {
+            self.state.start_selection();
+        }
+        self.state.home();
+        self.state.extend_selection();
+    }
+
+    fn end_with_selection(&mut self) {
+        if self.state.selection.is_none() {
+            self.state.start_selection();
+        }
+        let rope = self.buffer.rope();
+        self.state.end(rope);
+        self.state.extend_selection();
+    }
+
     /// Ensure cursor is visible within the viewport.
     pub fn ensure_visible(&mut self, viewport_height: usize) {
         self.state.ensure_cursor_visible(viewport_height);
@@ -1631,6 +1670,52 @@ mod tests {
     }
 
     #[test]
+    fn shift_home_selects_to_line_start() {
+        let mut ed = EditorContext::from_content("hello world");
+        set_cursor(&mut ed, 0, 5);
+
+        ed.handle_key(shift_key(KeyCode::Home));
+
+        assert_eq!(ed.state.cursor_col, 0);
+        assert_eq!(ed.state.selected_char_range(ed.buffer.rope()), Some((0, 5)));
+    }
+
+    #[test]
+    fn shift_end_selects_to_line_end() {
+        let mut ed = EditorContext::from_content("hello world");
+        set_cursor(&mut ed, 0, 6);
+
+        ed.handle_key(shift_key(KeyCode::End));
+
+        assert_eq!(ed.state.cursor_col, 11);
+        assert_eq!(
+            ed.state.selected_char_range(ed.buffer.rope()),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn home_and_end_clear_selection_without_shift() {
+        let mut ed = EditorContext::from_content("hello world");
+        set_cursor(&mut ed, 0, 0);
+        ed.handle_key(shift_key(KeyCode::Right));
+        assert!(ed.state.selection.is_some());
+
+        ed.handle_key(key(KeyCode::End));
+
+        assert!(ed.state.selection.is_none());
+        assert_eq!(ed.state.cursor_col, 11);
+
+        ed.handle_key(shift_key(KeyCode::Left));
+        assert!(ed.state.selection.is_some());
+
+        ed.handle_key(key(KeyCode::Home));
+
+        assert!(ed.state.selection.is_none());
+        assert_eq!(ed.state.cursor_col, 0);
+    }
+
+    #[test]
     fn tab_inserts_four_spaces() {
         let mut ed = EditorContext::from_content("text");
         set_cursor(&mut ed, 0, 0);
@@ -1653,6 +1738,55 @@ mod tests {
         set_cursor(&mut ed, 0, 0);
         ed.handle_key(ctrl_key(KeyCode::Right));
         assert_eq!(ed.state.cursor_col, 6); // start of "world"
+    }
+
+    #[test]
+    fn ctrl_shift_right_selects_to_next_word_boundary() {
+        let mut ed = EditorContext::from_content("hello world");
+        set_cursor(&mut ed, 0, 0);
+
+        ed.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(ed.state.cursor_col, 6);
+        assert_eq!(ed.state.selected_char_range(ed.buffer.rope()), Some((0, 6)));
+    }
+
+    #[test]
+    fn ctrl_shift_left_selects_to_previous_word_boundary() {
+        let mut ed = EditorContext::from_content("hello world");
+        set_cursor(&mut ed, 0, 11);
+
+        ed.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(ed.state.cursor_col, 6);
+        assert_eq!(
+            ed.state.selected_char_range(ed.buffer.rope()),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_word_selection_extends_existing_selection() {
+        let mut ed = EditorContext::from_content("one two three");
+        set_cursor(&mut ed, 0, 0);
+
+        ed.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        ed.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(ed.state.cursor_col, 8);
+        assert_eq!(ed.state.selected_char_range(ed.buffer.rope()), Some((0, 8)));
     }
 
     #[test]

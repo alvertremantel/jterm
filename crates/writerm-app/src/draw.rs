@@ -186,7 +186,19 @@ fn draw_headings(frame: &mut Frame, app: &WritermApp, area: Rect) {
 fn draw_document(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     app.refresh_render_cache();
     let visual = app.visual_document();
-    let text = visual.to_text(app.document_scroll, area.height as usize);
+    let max_scroll = visual
+        .rows
+        .len()
+        .saturating_sub(area.height.max(1) as usize);
+    app.document_scroll = app.document_scroll.min(max_scroll);
+    let text = visual.to_text_with_selection(
+        app.document_scroll,
+        area.height as usize,
+        app.editor
+            .state
+            .selected_char_range(app.editor.buffer.rope()),
+        Style::default().bg(theme::selection_bg()),
+    );
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(theme::text_primary())),
         area,
@@ -405,5 +417,53 @@ mod tests {
 
         assert!(source.contains("[Ctrl-M render:off]"));
         assert!(source.contains("# Title"));
+    }
+
+    #[test]
+    fn rendered_shift_selection_uses_selection_background() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+        app.editor.move_cursor_to_char_pos(2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected = &buffer[(0, 1)];
+        let unselected = &buffer[(1, 1)];
+        assert_eq!(selected.symbol(), "H");
+        assert_eq!(selected.bg, theme::selection_bg());
+        assert_eq!(selected.fg, theme::heading_h1());
+        assert_ne!(unselected.bg, theme::selection_bg());
+    }
+
+    #[test]
+    fn source_peek_shift_selection_uses_selection_background() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+        app.source_peek = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected = &buffer[(0, 1)];
+        let unselected = &buffer[(1, 1)];
+        assert_eq!(selected.symbol(), "#");
+        assert_eq!(selected.bg, theme::selection_bg());
+        assert_eq!(selected.fg, theme::text_primary());
+        assert_ne!(unselected.bg, theme::selection_bg());
     }
 }

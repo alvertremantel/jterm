@@ -176,6 +176,8 @@ struct MappedMarkdownRenderer<'a> {
     blockquote_depth: usize,
     in_code_block: bool,
     in_table: bool,
+    table_row_index: usize,
+    pending_table_delimiter_source: Option<SourceRange>,
     first_table_cell: bool,
     pending_line_source: Option<SourceRange>,
 }
@@ -191,6 +193,8 @@ impl<'a> MappedMarkdownRenderer<'a> {
             blockquote_depth: 0,
             in_code_block: false,
             in_table: false,
+            table_row_index: 0,
+            pending_table_delimiter_source: None,
             first_table_cell: true,
             pending_line_source: None,
         }
@@ -225,7 +229,7 @@ impl<'a> MappedMarkdownRenderer<'a> {
     fn handle_event(&mut self, event: Event<'_>, range: std::ops::Range<usize>) {
         match event {
             Event::Start(tag) => self.handle_start(tag, range),
-            Event::End(tag_end) => self.handle_end(tag_end),
+            Event::End(tag_end) => self.handle_end(tag_end, range),
             Event::Text(text) => {
                 if self.in_code_block {
                     self.push_multiline_text(&text, range, self.current_style());
@@ -253,14 +257,16 @@ impl<'a> MappedMarkdownRenderer<'a> {
                 self.lines.push(RenderedLine::default());
             }
             Event::TaskListMarker(checked) => {
-                self.push_visual(
+                self.push_visual_sourced(
                     if checked { "[✓] " } else { "[ ] " },
+                    range,
                     Style::default().fg(theme::task_marker()),
                 );
             }
             Event::FootnoteReference(label) => {
-                self.push_visual(
-                    format!("[{label}]"),
+                self.push_visual_sourced(
+                    format!("[^{label}]"),
+                    range,
                     Style::default()
                         .fg(theme::footnote_ref())
                         .add_modifier(Modifier::BOLD),
@@ -321,13 +327,25 @@ impl<'a> MappedMarkdownRenderer<'a> {
                 self.push_visual(marker, Style::default().fg(theme::list_bullet()));
             }
             Tag::Table(_) => {
+                self.pending_table_delimiter_source =
+                    self.table_delimiter_source_range(_range.clone());
                 self.set_pending_line_source(_range.clone());
                 if !self.current_spans.is_empty() {
                     self.finish_line();
                 }
                 self.in_table = true;
+                self.table_row_index = 0;
             }
             Tag::TableRow => {
+                if self.in_table
+                    && self.table_row_index == 1
+                    && let Some(source) = self.pending_table_delimiter_source.take()
+                {
+                    self.pending_line_source = Some(match self.pending_line_source.take() {
+                        Some(existing) => merge_source_ranges(existing, source),
+                        None => source,
+                    });
+                }
                 self.first_table_cell = true;
             }
             Tag::TableCell => {
@@ -338,6 +356,22 @@ impl<'a> MappedMarkdownRenderer<'a> {
             }
             Tag::Paragraph => {
                 self.set_pending_line_source(_range.clone());
+            }
+            Tag::FootnoteDefinition(label) => {
+                if !self.current_spans.is_empty() {
+                    self.finish_line();
+                }
+                let prefix = format!("[^{label}]: ");
+                let prefix_range = self
+                    .footnote_definition_prefix_range(_range.clone())
+                    .unwrap_or(_range);
+                self.push_visual_sourced(
+                    prefix,
+                    prefix_range,
+                    Style::default()
+                        .fg(theme::footnote_def())
+                        .add_modifier(Modifier::BOLD),
+                );
             }
             _ => {}
         }
@@ -351,7 +385,7 @@ impl<'a> MappedMarkdownRenderer<'a> {
         });
     }
 
-    fn handle_end(&mut self, tag_end: TagEnd) {
+    fn handle_end(&mut self, tag_end: TagEnd, range: std::ops::Range<usize>) {
         match tag_end {
             TagEnd::Heading(_) => {
                 self.pop_style();
@@ -362,9 +396,10 @@ impl<'a> MappedMarkdownRenderer<'a> {
                 self.pop_style();
             }
             TagEnd::CodeBlock => {
+                self.set_pending_line_source(range);
                 self.in_code_block = false;
                 self.pop_style();
-                if !self.current_spans.is_empty() {
+                if !self.current_spans.is_empty() || self.pending_line_source.is_some() {
                     self.finish_line();
                 }
                 self.lines.push(RenderedLine::default());
@@ -389,11 +424,21 @@ impl<'a> MappedMarkdownRenderer<'a> {
                 }
                 self.lines.push(RenderedLine::default());
             }
-            TagEnd::TableRow => self.finish_line(),
+            TagEnd::TableHead => {
+                self.finish_line();
+                self.table_row_index = 1;
+            }
+            TagEnd::TableRow => {
+                self.finish_line();
+                self.table_row_index += 1;
+            }
             TagEnd::Table => {
                 self.in_table = false;
+                self.table_row_index = 0;
+                self.pending_table_delimiter_source = None;
                 self.lines.push(RenderedLine::default());
             }
+            TagEnd::FootnoteDefinition if !self.current_spans.is_empty() => self.finish_line(),
             _ => {}
         }
     }
@@ -421,6 +466,19 @@ impl<'a> MappedMarkdownRenderer<'a> {
         });
     }
 
+    fn push_visual_sourced<S: Into<String>>(
+        &mut self,
+        content: S,
+        range: std::ops::Range<usize>,
+        style: Style,
+    ) {
+        self.current_spans.push(RenderedSpan {
+            content: content.into(),
+            style,
+            source: Some(self.source_range(range)),
+        });
+    }
+
     fn push_text(&mut self, content: &str, range: Option<std::ops::Range<usize>>, style: Style) {
         if content.is_empty() {
             return;
@@ -439,6 +497,17 @@ impl<'a> MappedMarkdownRenderer<'a> {
             char_start: self.input[..range.start].chars().count(),
             char_end: self.input[..range.end].chars().count(),
         }
+    }
+
+    fn table_delimiter_source_range(&self, range: std::ops::Range<usize>) -> Option<SourceRange> {
+        find_table_delimiter_byte_range(self.input, range).map(|range| self.source_range(range))
+    }
+
+    fn footnote_definition_prefix_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Option<std::ops::Range<usize>> {
+        find_footnote_definition_prefix_range(self.input, range)
     }
 
     fn finish_line(&mut self) {
@@ -542,6 +611,10 @@ fn assign_blank_line_sources(doc: &mut RenderedDocument, input: &str) {
 }
 
 fn physical_blank_line_char_starts(input: &str) -> Vec<usize> {
+    if input.is_empty() {
+        return vec![0];
+    }
+
     let mut starts = Vec::new();
     let mut char_start = 0usize;
     for line in input.split_inclusive('\n') {
@@ -563,6 +636,50 @@ fn byte_offset_for_char(input: &str, char_pos: usize) -> usize {
         .nth(char_pos)
         .map(|(idx, _)| idx)
         .unwrap_or(input.len())
+}
+
+fn find_table_delimiter_byte_range(
+    input: &str,
+    table_range: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let table = input.get(table_range.clone())?;
+    let mut byte_cursor = table_range.start;
+    for (physical_row, line) in table.split_inclusive('\n').enumerate() {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        if physical_row > 0 && is_table_delimiter_line(content) {
+            return Some(byte_cursor..byte_cursor + content.len());
+        }
+        byte_cursor += line.len();
+    }
+    None
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|ch| ch == '-')
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn find_footnote_definition_prefix_range(
+    input: &str,
+    range: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let slice = input.get(range.clone())?;
+    let close = slice.find("]:")?;
+    let mut end = range.start + close + 2;
+    while end < range.end {
+        let Some(ch) = input[end..range.end].chars().next() else {
+            break;
+        };
+        if ch != ' ' && ch != '\t' {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    Some(range.start..end)
 }
 
 // ── Bullet styles per nesting depth ──────────────────────────────────
@@ -1355,6 +1472,81 @@ mod tests {
         assert_eq!(doc.display_to_source(0, 0), Some(0));
         assert_eq!(doc.display_to_source(1, 0), Some(2));
         assert_eq!(doc.source_to_display(2), Some((1, 0)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_empty_document_to_start() {
+        let doc = render_markdown_mapped("");
+
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_empty_fenced_code_block_to_source_anchor() {
+        let doc = render_markdown_mapped("```\n```");
+
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        for char_pos in [0, 3, 4, 7] {
+            assert_eq!(doc.source_to_display(char_pos), Some((0, 0)));
+        }
+    }
+
+    #[test]
+    fn mapped_renderer_maps_task_checkbox_marker() {
+        let doc = render_markdown_mapped("- [ ] task");
+
+        assert_eq!(doc.source_to_display(2), Some((0, 2)));
+        assert_eq!(doc.source_to_display(4), Some((0, 4)));
+        assert_eq!(doc.display_to_source(0, 2), Some(2));
+        assert_eq!(doc.display_to_source(0, 4), Some(4));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_table_delimiter_to_body_transition() {
+        let doc = render_markdown_mapped("| A |\n|---|\n| B |");
+
+        for char_pos in 6..=11 {
+            assert_eq!(doc.source_to_display(char_pos), Some((1, 0)));
+        }
+        assert_eq!(doc.source_to_display(12), Some((1, 0)));
+        assert_eq!(doc.source_to_display(13), Some((1, 0)));
+        assert_eq!(doc.display_to_source(1, 0), Some(14));
+    }
+
+    #[test]
+    fn mapped_renderer_does_not_treat_dash_header_cell_as_table_delimiter() {
+        let doc = render_markdown_mapped("| --- |\n| --- |\n| B |");
+
+        assert_eq!(doc.source_to_display(6), Some((0, 3)));
+        for char_pos in 8..=15 {
+            assert_eq!(doc.source_to_display(char_pos), Some((1, 0)));
+        }
+    }
+
+    #[test]
+    fn mapped_renderer_preserves_footnote_reference_caret() {
+        let doc = render_markdown_mapped("see [^a]");
+
+        assert_eq!(doc.lines[0].plain_text(), "see [^a]");
+        assert_eq!(doc.source_to_display(4), Some((0, 4)));
+        assert_eq!(doc.source_to_display(8), Some((0, 8)));
+    }
+
+    #[test]
+    fn mapped_renderer_maps_footnote_definition_prefix() {
+        let doc = render_markdown_mapped("see [^a]\n\n[^a]: note");
+        let row = doc
+            .lines
+            .iter()
+            .position(|line| line.plain_text().starts_with("[^a]:"))
+            .expect("footnote definition row should render");
+
+        assert_eq!(doc.lines[row].plain_text(), "[^a]: note");
+        assert_eq!(doc.display_to_source(row, 0), Some(10));
+        assert_eq!(doc.display_to_source(row, 6), Some(16));
+        assert_eq!(doc.source_to_display(10), Some((row, 0)));
+        assert_eq!(doc.source_to_display(16), Some((row, 6)));
     }
 
     #[test]
