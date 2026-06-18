@@ -11,9 +11,8 @@ authoritative and treat the suite as three applications built from many small, s
 - Preserved exclusion: `termite/.worktrees/*` is intentionally excluded from workspace membership
 
 ### Authoritative source tree
-
 - `crates/` — all active workspace member crates, including binaries and shared libraries 
-- `termite/.worktrees/` — preserved user worktrees/state; do **not** treat them as workspace crates.
+- `.wt/` — preserved user worktrees/state; do **not** treat them as workspace crates.
 If code/config/docs disagree with the active crates under `crates/`, the `crates/` tree wins.
 
 
