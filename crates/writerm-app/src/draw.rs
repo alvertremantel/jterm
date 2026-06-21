@@ -1,11 +1,11 @@
-use crate::app::{WritermApp, is_markdown_path};
+use crate::app::{is_markdown_path, WritermApp};
 use jones_theme as theme;
 use jones_workspace::WorkspaceEntryKind;
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 const MIN_DOCUMENT_WIDTH: u16 = 40;
 const SIDEBAR_GAP: u16 = 2;
@@ -309,8 +309,8 @@ mod tests {
     use super::*;
     use crate::app::WritermApp;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use tempfile::TempDir;
     use writerm_config::Config;
 
@@ -465,5 +465,124 @@ mod tests {
         assert_eq!(selected.bg, theme::selection_bg());
         assert_eq!(selected.fg, theme::text_primary());
         assert_ne!(unselected.bg, theme::selection_bg());
+    }
+
+    #[test]
+    fn cursor_advances_after_typing_space_at_end_of_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+        app.editor.move_cursor_to_char_pos(5);
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let before = terminal.backend().cursor_position();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let after = terminal.backend().cursor_position();
+
+        assert_eq!(
+            after.x,
+            before.x + 1,
+            "cursor should advance one cell after space"
+        );
+        assert_eq!(after.y, before.y, "cursor should stay on the same row");
+    }
+
+    #[test]
+    fn end_key_on_line_with_trailing_whitespace_lands_past_the_space() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello ").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        // Draw first to populate document_area.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.editor.move_cursor_to_char_pos(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            app.editor.cursor_char_pos(),
+            6,
+            "End should reach past the trailing space"
+        );
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(
+            cursor.x,
+            app.document_area.x + 6,
+            "cursor x should be 6 cells past document start"
+        );
+    }
+
+    #[test]
+    fn cursor_moves_to_wrapped_row_after_typing_at_trailing_space_wrap_boundary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "abcdefgh").unwrap();
+        let backend = TestBackend::new(8, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.document_area.width, 8,
+            "precondition: doc area is 8 wide"
+        );
+
+        app.editor.move_cursor_to_char_pos(8);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.editor.cursor_char_pos(), 9);
+        assert_eq!(app.visual_document().source_to_display(8), Some((1, 0)));
+        assert_eq!(app.visual_document().source_to_display(9), Some((1, 1)));
+        terminal.backend_mut().assert_cursor_position((1, 2));
+    }
+
+    #[test]
+    fn selection_over_synthesized_trailing_space_cell() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        // Draw first to populate document_area.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.editor.move_cursor_to_char_pos(5);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        // Select from char 4 to char 6 (covering the synthesized space at char 5).
+        app.editor.move_cursor_to_char_pos(4);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let doc_col = (app.document_area.x + 5).min(buffer.area.width.saturating_sub(1));
+        let doc_row = app.document_area.y;
+        let cell = &buffer[(doc_col, doc_row)];
+        assert_eq!(cell.symbol(), " ");
+        assert_eq!(
+            cell.bg,
+            theme::selection_bg(),
+            "synthesized space cell should show selection bg"
+        );
     }
 }

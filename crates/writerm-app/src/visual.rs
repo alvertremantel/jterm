@@ -4,6 +4,12 @@ use ratatui::text::{Line, Span, Text};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrapMode {
+    Source,
+    Rendered,
+}
+
 #[derive(Debug, Clone)]
 pub struct VisualDocument {
     pub rows: Vec<VisualRow>,
@@ -58,7 +64,7 @@ impl VisualDocument {
                 cells,
                 Some((char_start, char_start + line_len)),
                 width,
-                false,
+                WrapMode::Source,
             ));
             char_start += line.chars().count();
         }
@@ -74,13 +80,39 @@ impl VisualDocument {
         let width = width.max(1);
         let mut rows = Vec::new();
         for line in &rendered.lines {
+            let mut cells = rendered_line_cells(line);
+
+            // Synthesize trailing-whitespace cells for source positions
+            // that pulldown-cmark stripped from Text events but that the
+            // paragraph source range still covers. Without these cells the
+            // cursor cannot address those source positions.
+            if let Some(src) = &line.source
+                && !cells.is_empty()
+            {
+                let last_end = cells
+                    .iter()
+                    .rev()
+                    .find_map(|c| c.source.map(|(_, end)| end));
+                let need_synth = last_end.is_some_and(|le| le < src.char_end);
+                if need_synth {
+                    let le = last_end.unwrap();
+                    for pos in le..src.char_end {
+                        cells.push(Cell {
+                            text: " ".to_string(),
+                            style: Style::default(),
+                            source: Some((pos, pos + 1)),
+                        });
+                    }
+                }
+            }
+
             rows.extend(wrap_cells(
-                rendered_line_cells(line),
+                cells,
                 line.source
                     .as_ref()
                     .map(|source| (source.char_start, source.char_end)),
                 width,
-                true,
+                WrapMode::Rendered,
             ));
         }
         if rows.is_empty() {
@@ -129,7 +161,7 @@ impl VisualDocument {
             if char_pos < row.source_start {
                 continue;
             }
-            if char_pos <= row.source_end {
+            if char_pos < row.source_end {
                 return Some((row_idx, row.col_for_source(char_pos)));
             }
             closest = Some((row_idx, row.width()));
@@ -165,9 +197,14 @@ impl VisualRow {
         }
     }
 
-    fn from_cells(mut cells: Vec<Cell>, trim_edges: bool, fallback_source: Option<usize>) -> Self {
-        if trim_edges {
-            trim_edge_spaces(&mut cells);
+    fn from_cells(mut cells: Vec<Cell>, mode: WrapMode, fallback_source: Option<usize>) -> Self {
+        if matches!(mode, WrapMode::Rendered) {
+            // In rendered mode, trim leading whitespace (indentation artifacts)
+            // but preserve trailing-whitespace-only rows (the wrapped row *is*
+            // just whitespace and must be addressable for cursor navigation).
+            if cells.iter().any(|c| !cell_is_whitespace(c)) {
+                trim_leading_spaces(&mut cells);
+            }
         }
         if cells.is_empty() {
             return fallback_source
@@ -353,7 +390,7 @@ fn wrap_cells(
     cells: Vec<Cell>,
     line_source: Option<(usize, usize)>,
     width: usize,
-    trim_edges: bool,
+    mode: WrapMode,
 ) -> Vec<VisualRow> {
     if cells.is_empty() {
         return vec![
@@ -363,7 +400,7 @@ fn wrap_cells(
         ];
     }
 
-    let mut wrapper = CellWrapper::new(width, trim_edges, line_source.map(|(start, _)| start));
+    let mut wrapper = CellWrapper::new(width, mode, line_source.map(|(start, _)| start));
     for cell in cells {
         wrapper.push(cell);
     }
@@ -381,7 +418,7 @@ fn wrap_cells(
 
 struct CellWrapper {
     width: usize,
-    trim_edges: bool,
+    mode: WrapMode,
     fallback_source: Option<usize>,
     rows: Vec<VisualRow>,
     current: Vec<Cell>,
@@ -389,10 +426,10 @@ struct CellWrapper {
 }
 
 impl CellWrapper {
-    fn new(width: usize, trim_edges: bool, fallback_source: Option<usize>) -> Self {
+    fn new(width: usize, mode: WrapMode, fallback_source: Option<usize>) -> Self {
         Self {
             width,
-            trim_edges,
+            mode,
             fallback_source,
             rows: Vec::new(),
             current: Vec::new(),
@@ -408,9 +445,20 @@ impl CellWrapper {
         }
 
         if cell_is_whitespace(&cell) {
-            trim_trailing_spaces(&mut self.current);
-            self.recompute_width();
-            self.flush_current();
+            match self.mode {
+                WrapMode::Rendered => {
+                    // Preserve the whitespace cell on the next row so the
+                    // cursor can address it. Invisible when drawn.
+                    self.flush_current();
+                    self.push_unchecked(cell);
+                }
+                WrapMode::Source => {
+                    // Standard text-editor wrapping: drop the wrap-boundary
+                    // space so the wrapped row doesn't start with a blank
+                    // cell. The cursor jumps the wrap in one keystroke.
+                    self.flush_current();
+                }
+            }
             return;
         }
 
@@ -444,7 +492,7 @@ impl CellWrapper {
         }
         self.rows.push(VisualRow::from_cells(
             std::mem::take(&mut self.current),
-            self.trim_edges,
+            self.mode,
             self.fallback_source,
         ));
         self.current_width = 0;
@@ -458,7 +506,7 @@ impl CellWrapper {
         if !self.current.is_empty() {
             self.rows.push(VisualRow::from_cells(
                 self.current,
-                self.trim_edges,
+                self.mode,
                 self.fallback_source,
             ));
         }
@@ -520,11 +568,6 @@ fn cell_is_whitespace(cell: &Cell) -> bool {
 
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
-}
-
-fn trim_edge_spaces(cells: &mut Vec<Cell>) {
-    trim_leading_spaces(cells);
-    trim_trailing_spaces(cells);
 }
 
 fn trim_leading_spaces(cells: &mut Vec<Cell>) {
@@ -689,11 +732,11 @@ mod tests {
     }
 
     #[test]
-    fn trailing_rendered_whitespace_maps_to_previous_visible_row() {
+    fn trailing_rendered_whitespace_maps_to_own_cell() {
         let rendered = render_markdown_mapped("hello ");
         let doc = VisualDocument::from_rendered(&rendered, 20);
 
-        assert_eq!(doc.source_to_display(6), Some((0, 5)));
+        assert_eq!(doc.source_to_display(6), Some((0, 6)));
     }
 
     #[test]

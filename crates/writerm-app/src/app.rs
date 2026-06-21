@@ -1258,7 +1258,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
         assert_eq!(app.editor.cursor_char_pos(), 6);
-        assert_eq!(app.visual_document().source_to_display(6), Some((0, 5)));
+        assert_eq!(app.visual_document().source_to_display(6), Some((0, 6)));
         assert_eq!(app.document_scroll, 0);
     }
 

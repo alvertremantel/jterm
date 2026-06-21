@@ -558,7 +558,7 @@ impl<'a> MappedMarkdownRenderer<'a> {
             .cloned()
             .chain(self.pending_line_source.take())
             .reduce(merge_source_ranges);
-        trim_source_to_visible_span_bounds(&mut source, &spans);
+        trim_source_to_visible_span_bounds(&mut source, &spans, self.input);
 
         self.lines.push(RenderedLine { spans, source });
     }
@@ -578,7 +578,11 @@ fn merge_source_ranges(mut left: SourceRange, right: SourceRange) -> SourceRange
     left
 }
 
-fn trim_source_to_visible_span_bounds(source: &mut Option<SourceRange>, spans: &[RenderedSpan]) {
+fn trim_source_to_visible_span_bounds(
+    source: &mut Option<SourceRange>,
+    spans: &[RenderedSpan],
+    input: &str,
+) {
     let Some(source) = source else {
         return;
     };
@@ -589,9 +593,19 @@ fn trim_source_to_visible_span_bounds(source: &mut Option<SourceRange>, spans: &
         return;
     };
     source.byte_start = source.byte_start.min(first_span.byte_start);
-    source.byte_end = source.byte_end.min(last_span.byte_end);
     source.char_start = source.char_start.min(first_span.char_start);
-    source.char_end = source.char_end.min(last_span.char_end);
+
+    // Only trim the source end when it extends past the last visible span
+    // AND crosses a newline boundary. Trailing whitespace before a newline
+    // (or at EOF) is real content — keep it so the cursor can address it.
+    // Trailing content past a newline belongs to the next line — trim it.
+    if source.byte_end > last_span.byte_end
+        && let Some(gap) = input.get(last_span.byte_end..source.byte_end)
+        && let Some(nl_off) = gap.find('\n')
+    {
+        source.byte_end = last_span.byte_end + nl_off;
+        source.char_end = input[..source.byte_end].chars().count();
+    }
 }
 
 fn display_width(text: &str) -> usize {
@@ -1863,5 +1877,23 @@ mod tests {
         let all_text = collect_text(&text);
         // Should contain the reference marker
         assert!(all_text.contains("[^note]"));
+    }
+
+    #[test]
+    fn rendered_line_source_covers_trailing_whitespace() {
+        let doc = render_markdown_mapped("hello ");
+        assert_eq!(doc.lines[0].spans[0].content, "hello");
+        assert_eq!(
+            doc.lines[0].source.as_ref().unwrap().char_end,
+            6,
+            "line source should cover the trailing space at char 5"
+        );
+
+        let doc = render_markdown_mapped("hello   ");
+        assert_eq!(
+            doc.lines[0].source.as_ref().unwrap().char_end,
+            8,
+            "line source should cover three trailing spaces"
+        );
     }
 }
