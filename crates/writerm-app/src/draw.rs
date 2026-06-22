@@ -1,14 +1,23 @@
-use crate::app::{is_markdown_path, WritermApp};
+use crate::app::{WritermApp, is_markdown_path};
 use jones_theme as theme;
 use jones_workspace::WorkspaceEntryKind;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
+
+use crate::metrics::format_reading_time;
 
 const MIN_DOCUMENT_WIDTH: u16 = 40;
 const SIDEBAR_GAP: u16 = 2;
+/// How the right-hand sidebar is split between the filesystem browser and
+/// the document-length metrics panel. The user-visible model is "split the
+/// sidebar in half, then shrink the bottom half down to roughly 1/8", which
+/// leaves 7/8 for the filesystem browser and 1/8 for the metrics readout.
+const FILES_PARTS: u32 = 7;
+const METRICS_PARTS: u32 = 1;
+const SIDEBAR_PARTS: u16 = (FILES_PARTS + METRICS_PARTS) as u16;
 
 pub fn draw(frame: &mut Frame, app: &mut WritermApp) {
     frame.render_widget(
@@ -69,19 +78,36 @@ fn draw_body(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
         Rect::default()
     };
     app.document_area = chunks[2];
-    app.files_area = if files_w > 0 {
-        chunks[4]
+    if files_w > 0 && chunks[4].height > 0 {
+        // Split the right sidebar vertically: top 7/8 stays the filesystem
+        // browser, bottom 1/8 becomes the document-length readout. We fall
+        // back to the whole sidebar as the files area when the height is too
+        // small for the ratio to produce a non-zero metrics slice.
+        let (files_only, metrics) = if chunks[4].height >= SIDEBAR_PARTS {
+            let vchunks = Layout::vertical([
+                Constraint::Ratio(FILES_PARTS, METRICS_PARTS),
+                Constraint::Ratio(METRICS_PARTS, FILES_PARTS),
+            ])
+            .split(chunks[4]);
+            (vchunks[0], vchunks[1])
+        } else {
+            (chunks[4], Rect::default())
+        };
+        app.files_area = files_only;
+        app.metrics_area = metrics;
+        draw_files(frame, app, files_only);
+        if metrics.height > 0 {
+            draw_metrics(frame, app, metrics);
+        }
     } else {
-        Rect::default()
-    };
+        app.files_area = Rect::default();
+        app.metrics_area = Rect::default();
+    }
 
     if headings_w > 0 {
         draw_headings(frame, app, chunks[0]);
     }
     draw_document(frame, app, chunks[2]);
-    if files_w > 0 {
-        draw_files(frame, app, chunks[4]);
-    }
 }
 
 fn draw_top_ribbon(frame: &mut Frame, app: &WritermApp, area: Rect) {
@@ -141,7 +167,7 @@ fn draw_bottom_bar(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     let headings = if app.show_headings { "on" } else { "off" };
     let files = if app.show_files { "on" } else { "off" };
     let text = format!(
-        " Ctrl-S save  Ctrl-B/I/K  [Ctrl-M render:{render}]  [F3 headings:{headings}]  [F2 files:{files}]  Ctrl-N new  Ctrl-Q quit "
+        " WRITERM  |  C-S: save  C-B/I/K: format  C-N: new  C-Q: quit  |  [C-M: render {render}]  [F3: headings {headings}]  [F2: files {files}] "
     );
     set_control_areas(app, area, &text, headings, files);
     frame.render_widget(
@@ -264,6 +290,71 @@ fn draw_files(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     );
 }
 
+fn draw_metrics(frame: &mut Frame, app: &WritermApp, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let metrics = app.document_metrics();
+    let reading = format_reading_time(metrics.reading_secs);
+    let width = area.width as usize;
+
+    let title_style = Style::default()
+        .fg(theme::text_secondary())
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(theme::text_primary());
+    let label_style = Style::default().fg(theme::text_dim());
+
+    let title = Line::from(Span::styled(truncate("─ Doc ─", width), title_style));
+    let chars_words = Line::from(Span::styled(
+        truncate(
+            &format!("{} ch · {} w", metrics.characters, metrics.words),
+            width,
+        ),
+        value_style,
+    ));
+    let sent_para_read = Line::from(Span::styled(
+        truncate(
+            &format!(
+                "{} sent · {} para · {} read",
+                metrics.sentences, metrics.paragraphs, reading
+            ),
+            width,
+        ),
+        label_style,
+    ));
+    let sent_para = Line::from(Span::styled(
+        truncate(
+            &format!("{} sent · {} para", metrics.sentences, metrics.paragraphs),
+            width,
+        ),
+        label_style,
+    ));
+    let reading_line = Line::from(Span::styled(
+        truncate(&format!("{reading} read"), width),
+        value_style,
+    ));
+    let emergency = Line::from(Span::styled(
+        truncate(&format!("{} w · {} read", metrics.words, reading), width),
+        value_style,
+    ));
+
+    // Show all five metrics whenever the panel is at least 3 rows tall, which
+    // is the typical case for any reasonable terminal height. Smaller panels
+    // gracefully drop the title and combine labels so the user still sees
+    // every metric the spec calls out.
+    let lines: Vec<Line> = match area.height {
+        1 => vec![emergency],
+        2 => vec![chars_words.clone(), sent_para_read],
+        3 => vec![title.clone(), chars_words, sent_para_read],
+        _ => vec![title, chars_words, sent_para, reading_line],
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::bg_surface())),
+        area,
+    );
+}
+
 fn draw_prompt(frame: &mut Frame, app: &WritermApp, area: Rect) {
     let prompt = format!(" New Markdown file: {}", app.prompt_buffer);
     frame.render_widget(
@@ -309,8 +400,8 @@ mod tests {
     use super::*;
     use crate::app::WritermApp;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use tempfile::TempDir;
     use writerm_config::Config;
 
@@ -356,10 +447,114 @@ mod tests {
         assert!(app.headings_area.width > 0);
         assert!(app.document_area.width > 0);
         assert!(app.files_area.width > 0);
+        assert!(app.metrics_area.width > 0);
         assert!(app.document_area.x >= app.headings_area.x + app.headings_area.width + SIDEBAR_GAP);
         assert!(app.files_area.x >= app.document_area.x + app.document_area.width + SIDEBAR_GAP);
+        // The metrics panel sits directly under the filesystem browser and
+        // is the bottom eighth (or as close as the layout can manage) of the
+        // right-hand sidebar.
+        assert_eq!(
+            app.files_area.x, app.metrics_area.x,
+            "metrics panel must share the files sidebar's column"
+        );
+        assert_eq!(
+            app.files_area.width, app.metrics_area.width,
+            "metrics panel must share the files sidebar's width"
+        );
+        assert!(
+            app.metrics_area.y >= app.files_area.y,
+            "metrics panel must start at or below the files area"
+        );
+        let combined_height = app.files_area.height + app.metrics_area.height;
+        assert_eq!(combined_height, 22, "top + bottom should fill the body");
+        // Bottom slice is approximately the bottom eighth (within 1 row of the
+        // true 1/8 of 22) and the top slice gets the rest.
+        assert!(
+            (2..=4).contains(&app.metrics_area.height),
+            "metrics panel height should be 2-4 rows for a 24-line terminal, got {}",
+            app.metrics_area.height
+        );
         assert!(app.headings_control_area.width > 0);
         assert!(app.files_control_area.width > 0);
+    }
+
+    #[test]
+    fn metrics_panel_renders_all_five_metrics_for_three_row_height() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // 3 paragraphs of text, each with one sentence-ending punctuation
+        // mark. Words: 3 + 4 + 3 = 10. Chars: 19 + 2 + 19 + 2 + 15 = 57.
+        std::fs::write(
+            &path,
+            "Hello there friend.\n\nA second line here.\n\nThird para now!",
+        )
+        .unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        // Title bar of the metrics panel.
+        assert!(
+            rendered.contains("─ Doc ─"),
+            "metrics title should be present"
+        );
+        // Word count and character count appear on the first data line.
+        assert!(rendered.contains("10 w"), "word count should be present");
+        assert!(
+            rendered.contains("57 ch"),
+            "character count should be present"
+        );
+        // Sentences and paragraphs appear on the combined data line.
+        assert!(
+            rendered.contains("3 sent"),
+            "sentence count should be present"
+        );
+        assert!(
+            rendered.contains("3 para"),
+            "paragraph count should be present"
+        );
+        // Reading time is included on the same line for 3-row panels.
+        // 10 words at 180 wpm = ceil(3.33s) = 4s.
+        assert!(
+            rendered.contains("4s read"),
+            "reading time should be present, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn metrics_panel_updates_as_user_types() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one.").unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.document_area = Rect::new(0, 0, 80, 1);
+        // Park the cursor at the end of the existing text so typing extends
+        // the document instead of inserting at position 0.
+        app.editor.move_cursor_to_char_pos(app.editor.text().len());
+
+        // Type "two three" at the end so we go from 1 word / 1 paragraph to
+        // 3 words / 1 paragraph.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        for ch in "two three".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        assert!(
+            rendered.contains("3 w"),
+            "should reflect 3 words after typing"
+        );
+        assert!(
+            rendered.contains("1 para"),
+            "should be 1 paragraph after typing"
+        );
     }
 
     #[test]
@@ -376,9 +571,42 @@ mod tests {
 
         assert_eq!(app.headings_area.width, 0);
         assert_eq!(app.files_area.width, 0);
+        // Metrics panel only exists as the bottom eighth of the files
+        // sidebar, so it must be empty whenever the sidebar is hidden.
+        assert_eq!(app.metrics_area.width, 0);
+        assert_eq!(app.metrics_area.height, 0);
         assert!(app.document_area.width > 0);
         assert!(!rendered.contains('┌'));
         assert!(!rendered.contains('│'));
+    }
+
+    #[test]
+    fn hiding_files_sidebar_via_f2_also_hides_metrics_panel() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Title\n\nHello there friend.").unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+
+        // Sanity check: with the sidebar visible, the metrics panel exists.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.files_area.width > 0);
+        assert!(app.metrics_area.width > 0);
+
+        // Toggle the files sidebar off; the metrics panel must collapse with
+        // it, since the panel only lives inside the files sidebar.
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        assert_eq!(app.files_area.width, 0);
+        assert_eq!(app.metrics_area.width, 0);
+        assert_eq!(app.metrics_area.height, 0);
+        assert!(
+            !rendered.contains("─ Doc ─"),
+            "metrics title should be hidden when the files sidebar is hidden"
+        );
     }
 
     #[test]

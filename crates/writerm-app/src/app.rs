@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use writerm_config::Config;
 
+use crate::metrics::{DocumentMetrics, compute as compute_metrics};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
     NewFile,
@@ -44,6 +46,7 @@ pub struct WritermApp {
     pub headings_area: Rect,
     pub document_area: Rect,
     pub files_area: Rect,
+    pub metrics_area: Rect,
     pub headings_control_area: Rect,
     pub files_control_area: Rect,
     pub drag_selecting: bool,
@@ -104,6 +107,7 @@ impl WritermApp {
             headings_area: Rect::default(),
             document_area: Rect::default(),
             files_area: Rect::default(),
+            metrics_area: Rect::default(),
             headings_control_area: Rect::default(),
             files_control_area: Rect::default(),
             drag_selecting: false,
@@ -639,6 +643,13 @@ impl WritermApp {
 
     pub fn word_count(&self) -> usize {
         self.editor.text().split_whitespace().count()
+    }
+
+    /// Snapshot the current editor's document-length metrics for display in
+    /// the bottom-eighth sidebar panel. Always reads from the raw editor
+    /// text so the counts are stable across rendered/source-peek toggles.
+    pub fn document_metrics(&self) -> DocumentMetrics {
+        compute_metrics(&self.editor.text())
     }
 
     pub fn current_heading(&self) -> Option<String> {

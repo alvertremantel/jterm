@@ -1,5 +1,6 @@
 pub mod app;
 pub mod draw;
+pub mod metrics;
 mod visual;
 
 pub use app::WritermApp;
