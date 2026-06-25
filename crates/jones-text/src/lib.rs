@@ -5,7 +5,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use ropey::Rope;
 use tempfile::NamedTempFile;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -542,6 +542,14 @@ pub fn gutter_width(total_lines: usize) -> u16 {
     digits.max(3) + 1
 }
 
+/// Compute the display width of a string by summing the terminal cell width
+/// of each Unicode grapheme cluster. This is the single source of truth for
+/// display-width computation across the workspace — it correctly handles
+/// CJK wide characters, ZWJ emoji sequences, and combining marks.
+pub fn grapheme_display_width(s: &str) -> usize {
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
 pub fn char_col_to_display_col(line_text: &str, char_col: usize) -> usize {
     line_text
         .chars()
@@ -554,10 +562,7 @@ pub fn display_col_to_char_col(line_text: &str, display_col: usize) -> usize {
     let mut accum = 0;
     let mut char_pos = 0;
     for grapheme in line_text.graphemes(true) {
-        let g_width: usize = grapheme
-            .chars()
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
+        let g_width = grapheme_display_width(grapheme);
         if accum >= display_col {
             return char_pos;
         }
@@ -704,6 +709,41 @@ mod tests {
         assert_eq!(nth_char_byte_offset(text, 2), "a界".len());
         assert_eq!(prev_grapheme_boundary(text, 3), 2);
         assert_eq!(next_grapheme_boundary(text, 2), 3);
+    }
+
+    #[test]
+    fn grapheme_display_width_empty_string() {
+        assert_eq!(grapheme_display_width(""), 0);
+    }
+
+    #[test]
+    fn grapheme_display_width_ascii() {
+        assert_eq!(grapheme_display_width("hello"), 5);
+    }
+
+    #[test]
+    fn grapheme_display_width_trailing_whitespace() {
+        assert_eq!(grapheme_display_width("hi  "), 4);
+    }
+
+    #[test]
+    fn grapheme_display_width_combining_mark() {
+        // e + combining acute accent = single grapheme of display width 1
+        assert_eq!(grapheme_display_width("e\u{0301}"), 1);
+    }
+
+    #[test]
+    fn grapheme_display_width_zwj_emoji_family() {
+        // 👨‍👩‍👧 — 5 codepoints, 1 grapheme cluster, display width 2
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(family.graphemes(true).count(), 1);
+        assert_eq!(grapheme_display_width(family), 2);
+    }
+
+    #[test]
+    fn grapheme_display_width_cjk() {
+        assert_eq!(grapheme_display_width("界"), 2);
+        assert_eq!(grapheme_display_width("日本語"), 6);
     }
 
     #[test]

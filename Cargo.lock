@@ -874,7 +874,6 @@ dependencies = [
  "jones-theme",
  "pulldown-cmark",
  "ratatui",
- "unicode-width",
 ]
 
 [[package]]
@@ -2804,12 +2803,12 @@ dependencies = [
  "jones-outline",
  "jones-render",
  "jones-terminal",
+ "jones-text",
  "jones-theme",
  "jones-workspace",
  "ratatui",
  "tempfile",
  "unicode-segmentation",
- "unicode-width",
  "writerm-config",
 ]
 

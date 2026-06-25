@@ -1,8 +1,8 @@
 use jones_render::{RenderedDocument, RenderedLine};
+use jones_text::grapheme_display_width;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Visual width of a single `\t` source character in the writerm document
 /// surface. The editor's Tab key inserts a tab character; the virtual
@@ -607,7 +607,7 @@ fn cell_width(cell: &Cell) -> usize {
 }
 
 fn text_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    grapheme_display_width(text)
 }
 
 fn cell_is_whitespace(cell: &Cell) -> bool {

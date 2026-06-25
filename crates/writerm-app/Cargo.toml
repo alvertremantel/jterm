@@ -12,13 +12,13 @@ jones-event = { path = "../jones-event" }
 jones-outline = { path = "../jones-outline" }
 jones-render = { path = "../jones-render" }
 jones-terminal = { path = "../jones-terminal" }
+jones-text = { path = "../jones-text" }
 jones-theme = { path = "../jones-theme" }
 jones-workspace = { path = "../jones-workspace" }
 writerm-config = { path = "../writerm-config" }
 ratatui.workspace = true
 crossterm.workspace = true
 color-eyre.workspace = true
-unicode-width = "0.2"
 unicode-segmentation = "1"
 
 [dev-dependencies]
