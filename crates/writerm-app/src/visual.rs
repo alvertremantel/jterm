@@ -26,7 +26,6 @@ pub struct VisualDocument {
 pub struct VisualRow {
     spans: Vec<VisualSpan>,
     col_sources: Vec<usize>,
-    boundaries: Vec<(usize, usize)>,
     source_start: usize,
     source_end: usize,
     mapped: bool,
@@ -199,7 +198,6 @@ impl VisualRow {
         Self {
             spans: Vec::new(),
             col_sources: Vec::new(),
-            boundaries: vec![(source_start, 0), (source_end, 0)],
             source_start,
             source_end,
             mapped: true,
@@ -210,7 +208,6 @@ impl VisualRow {
         Self {
             spans: Vec::new(),
             col_sources: Vec::new(),
-            boundaries: Vec::new(),
             source_start: 0,
             source_end: 0,
             mapped: false,
@@ -245,29 +242,20 @@ impl VisualRow {
         let fallback_source = first_source.or(fallback_source).unwrap_or(source_start);
         let mut spans = Vec::new();
         let mut col_sources = Vec::new();
-        let mut boundaries = vec![(source_start, 0)];
-        let mut col = 0usize;
 
         for cell in cells {
             push_cell_span(&mut spans, &cell.text, cell.style);
             let width = cell_width(&cell);
-            if let Some((start, end)) = cell.source {
-                boundaries.push((start, col));
-                boundaries.push((end, col + width));
+            if let Some((start, _end)) = cell.source {
                 col_sources.extend(std::iter::repeat_n(start, width));
             } else {
                 col_sources.extend(std::iter::repeat_n(fallback_source, width));
             }
-            col += width;
         }
-        boundaries.push((source_end, col));
-        boundaries.sort_unstable();
-        boundaries.dedup();
 
         Self {
             spans,
             col_sources,
-            boundaries,
             source_start,
             source_end,
             mapped: true,
@@ -276,16 +264,10 @@ impl VisualRow {
 
     fn include_source_start(&mut self, source: usize) {
         self.source_start = self.source_start.min(source);
-        self.boundaries.push((self.source_start, 0));
-        self.boundaries.sort_unstable();
-        self.boundaries.dedup();
     }
 
     fn include_source_end(&mut self, source: usize) {
         self.source_end = self.source_end.max(source);
-        self.boundaries.push((self.source_end, self.width()));
-        self.boundaries.sort_unstable();
-        self.boundaries.dedup();
     }
 
     fn to_line(&self) -> Line<'static> {
@@ -393,16 +375,25 @@ impl VisualRow {
 
     fn col_for_source(&self, char_pos: usize) -> usize {
         let mut best_col = 0usize;
-        for (source, col) in &self.boundaries {
-            if *source == char_pos {
-                return *col;
+        let mut prev_source = usize::MAX;
+        for (col, &source) in self.col_sources.iter().enumerate() {
+            if source == char_pos {
+                return col;
             }
-            if *source > char_pos {
+            if source > char_pos {
                 return best_col;
             }
-            best_col = *col;
+            // source < char_pos: this cell starts before char_pos.
+            // Update best_col only at the FIRST column of a new cell
+            // (where source differs from the previous cell's source), to
+            // match the old boundary-based logic for wide chars/tabs that
+            // repeat the same source across multiple display columns.
+            if source != prev_source {
+                best_col = col;
+                prev_source = source;
+            }
         }
-        self.width()
+        best_col
     }
 }
 
