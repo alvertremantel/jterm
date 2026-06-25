@@ -225,7 +225,7 @@ impl WritermApp {
             }
             KeyCode::Up if !ctrl && !alt => self.move_visual_vertical(-1, shift),
             KeyCode::Down if !ctrl && !alt => self.move_visual_vertical(1, shift),
-            KeyCode::Up | KeyCode::Down if !self.source_peek && (ctrl || alt) => {}
+            KeyCode::Up | KeyCode::Down if ctrl || alt => {}
             _ => self.handle_editor_key(key),
         }
     }
