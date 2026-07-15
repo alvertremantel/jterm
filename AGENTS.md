@@ -17,8 +17,6 @@ authoritative and treat the suite as three applications built from many small, s
 - `.wt/` — preserved user worktrees/state; do **not** treat them as workspace crates.
 If code/config/docs disagree with the active crates under `crates/`, the `crates/` tree wins.
 
-
-
 ## Application map
 
 There are three end-user applications:
