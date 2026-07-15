@@ -602,6 +602,11 @@ impl WritermApp {
             .unwrap_or_else(|| self.cwd.clone());
         self.current_file_path = path;
         self.editor = EditorContext::from_content(&content);
+        // A newly opened buffer starts at version 0, which may equal the
+        // version of the previous file's word-progress cache. Invalidate it
+        // explicitly so counts cannot be reused across documents.
+        self.word_progress_version = u64::MAX;
+        self.word_byte_starts.clear();
         self.document_scroll = 0;
         self.heading_scroll = 0;
         self.desired_display_col = None;
@@ -2964,6 +2969,27 @@ mod tests {
         assert_ne!(v1, app.editor.buffer.version(), "version should change");
         let (_c2, t2) = app.cursor_word_progress();
         assert_eq!(t2, 3, "should now have 3 words");
+    }
+
+    #[test]
+    fn word_progress_rebuilds_after_opening_another_file() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        std::fs::write(&first, vec!["word"; 816].join(" ")).unwrap();
+        std::fs::write(&second, vec!["word"; 900].join(" ")).unwrap();
+        let mut app = app_at(first);
+
+        let (_, first_total) = app.cursor_word_progress();
+        assert_eq!(first_total, 816);
+        assert_eq!(app.editor.buffer.version(), 0);
+
+        assert!(app.open_or_create_file(&second));
+        assert_eq!(app.editor.buffer.version(), 0);
+        let end = app.editor.buffer.rope().len_chars();
+        app.editor.move_cursor_to_char_pos(end);
+
+        assert_eq!(app.cursor_word_progress(), (900, 900));
     }
 
     // ── Narrow-width indent regression test ─────────────────────────
