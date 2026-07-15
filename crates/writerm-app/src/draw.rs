@@ -1,4 +1,7 @@
 use crate::app::{WritermApp, is_markdown_path};
+use crate::visual::VisualDocument;
+use jones_outline;
+use jones_text;
 use jones_theme as theme;
 use jones_workspace::WorkspaceEntryKind;
 use ratatui::Frame;
@@ -102,7 +105,9 @@ fn draw_body(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     }
 
     if left_sep > 0 {
-        draw_vertical_separator(frame, chunks[1]);
+        // The left separator between the section-browser border and the
+        // heading gutter is exactly one blank column — no visible rule is
+        // drawn. This keeps the document area visually open.
     }
 
     draw_document(frame, app, chunks[2]);
@@ -233,51 +238,23 @@ fn draw_headings_panel(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     draw_headings_content(frame, app, inner);
 }
 
-fn draw_headings_content(frame: &mut Frame, app: &WritermApp, area: Rect) {
-    let mut lines = Vec::new();
+fn draw_headings_content(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     let max_rows = area.height as usize;
-    for entry in app
-        .outline_entries
+    let all_lines = app.build_heading_visual_lines(area.width);
+
+    // Clamp scroll so the panel never becomes spuriously empty when
+    // outline entries (and thus visual lines) shrink.
+    let max_scroll = all_lines.len().saturating_sub(area.height.max(1) as usize);
+    let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    app.heading_scroll = app.heading_scroll.min(max_scroll);
+
+    let lines: Vec<Line> = all_lines
         .iter()
         .skip(app.heading_scroll as usize)
         .take(max_rows)
-    {
-        let indent = "  ".repeat(entry.depth.saturating_sub(1));
-        let active = entry.line <= app.editor.state.cursor_line;
-        // Color the heading marker by its level so the panel reads like a
-        // color-coded outline. Inactive entries stay dimmed so the active
-        // heading stands out.
-        let level_color = match entry.depth {
-            1 => theme::heading_h1(),
-            2 => theme::heading_h2(),
-            3 => theme::heading_h3(),
-            4 => theme::heading_h4(),
-            5 => theme::heading_h5(),
-            _ => theme::heading_h6(),
-        };
-        let style = if active {
-            Style::default()
-                .fg(level_color)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::text_secondary())
-        };
-        // The bullet marks the heading depth: one to six dim dots that
-        // nest visually with the indent. We deliberately do not echo the
-        // source "##" markers because the headings list is a navigation
-        // aid, not a source preview.
-        let bullet = match entry.depth {
-            1 => "▸",
-            2 => "▸",
-            3 => "▸",
-            _ => "·",
-        };
-        let label_text = format!("{indent}{bullet} {}", entry.label);
-        lines.push(Line::from(Span::styled(
-            truncate(&label_text, area.width as usize),
-            style,
-        )));
-    }
+        .map(|hl| Line::from(Span::styled(hl.content.clone(), hl.style)))
+        .collect();
+
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(sidebar_bg())),
         area,
@@ -484,9 +461,28 @@ fn draw_document(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
         .len()
         .saturating_sub(area.height.max(1) as usize);
     app.document_scroll = app.document_scroll.min(max_scroll);
+
+    let layout = app.heading_gutter_layout();
+
+    // Draw the heading-marker gutter on the left. Non-heading rows and
+    // wrapped continuation rows show blank gutter cells.
+    if layout.gutter_cells > 0 {
+        let gutter_area = Rect::new(area.x, area.y, layout.gutter_cells, area.height);
+        draw_heading_gutter(frame, app, &visual, gutter_area);
+    }
+
+    // The text area begins after the gutter + blank separator and ends
+    // before the right margin. layout already accounts for the margin.
+    let text_area = Rect::new(
+        area.x + layout.text_x_offset,
+        area.y,
+        layout.text_width,
+        area.height,
+    );
+
     let text = visual.to_text_with_selection(
         app.document_scroll,
-        area.height as usize,
+        text_area.height as usize,
         app.editor
             .state
             .selected_char_range(app.editor.buffer.rope()),
@@ -498,12 +494,80 @@ fn draw_document(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     // surfaces for definition against the open document.
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(theme::text_primary())),
-        area,
+        text_area,
     );
 
-    if let Some((x, y)) = cursor_position(app, area, &visual) {
+    if let Some((x, y)) = cursor_position(app, text_area, &visual) {
         frame.set_cursor_position((x, y));
     }
+}
+
+/// Render the ATX `#` markers for heading rows in the gutter area. Only
+/// the *first* visual row of each heading receives markers; wrapped
+/// continuation rows and non-heading rows leave the gutter blank.
+fn draw_heading_gutter(frame: &mut Frame, app: &WritermApp, visual: &VisualDocument, area: Rect) {
+    use std::collections::HashMap;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // Source line → heading depth for quick lookup. Only actual heading
+    // entries (not section/symbol fallbacks) receive gutter markers.
+    let line_depths: HashMap<usize, usize> = app
+        .outline_entries
+        .iter()
+        .filter(|e| matches!(e.kind, jones_outline::OutlineKind::Heading))
+        .map(|e| (e.line, e.depth))
+        .collect();
+
+    let rope = app.editor.buffer.rope();
+    let max_depth = app.max_heading_depth().min(area.width as usize);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    let mut prev_source_line: Option<usize> = None;
+
+    let scroll = app.document_scroll;
+    let end = (scroll + area.height as usize).min(visual.rows.len());
+
+    // Seed prev_source_line from the row just above the scroll origin so
+    // that a wrapped continuation row at the top of the viewport is
+    // correctly recognised as a continuation (and gets no gutter marker)
+    // rather than being mistaken for the first row of a heading.
+    if scroll > 0
+        && let Some(source_pos) = visual.display_to_source(scroll - 1, 0)
+    {
+        prev_source_line = Some(rope.char_to_line(source_pos));
+    }
+
+    for row in scroll..end {
+        let marker_depth = if let Some(source_pos) = visual.display_to_source(row, 0) {
+            let source_line = rope.char_to_line(source_pos);
+            let is_first_row = prev_source_line != Some(source_line);
+            prev_source_line = Some(source_line);
+            if is_first_row {
+                line_depths.get(&source_line).copied()
+            } else {
+                None
+            }
+        } else {
+            prev_source_line = None;
+            None
+        };
+
+        let marker_text = match marker_depth {
+            Some(depth) if depth > 0 => "#".repeat(depth.min(max_depth)),
+            _ => String::new(),
+        };
+
+        let display = jones_text::truncate_to_display_width(&marker_text, area.width as usize);
+        lines.push(Line::from(Span::styled(
+            display.to_string(),
+            Style::default().fg(theme::text_dim()),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn cursor_position(
@@ -562,7 +626,7 @@ fn control_area(area: Rect, text: &str, label: &str) -> Rect {
 }
 
 fn truncate(s: &str, max_width: usize) -> String {
-    s.chars().take(max_width).collect()
+    jones_text::truncate_to_display_width(s, max_width).to_string()
 }
 
 #[cfg(test)]
@@ -698,15 +762,16 @@ mod tests {
             "files panel should have a top-left border"
         );
 
-        // The vertical line between each sidebar and the document area
-        // is drawn as a │ character at the top of the separator area.
+        // The left separator between the headings panel and the document
+        // area is a blank column (no visible rule). The right separator
+        // still uses a │ character.
         let left_sep_x = app.document_area.x - SIDEBAR_SEP_WIDTH;
         let left_sep_char = buffer[(left_sep_x, app.document_area.y)].symbol();
         let right_sep_x = app.document_area.x + app.document_area.width;
         let right_sep_char = buffer[(right_sep_x, app.document_area.y)].symbol();
         assert_eq!(
-            left_sep_char, "│",
-            "left separator should be a vertical line"
+            left_sep_char, " ",
+            "left separator should be a blank column"
         );
         assert_eq!(
             right_sep_char, "│",
@@ -950,13 +1015,17 @@ mod tests {
         // terminal it may be truncated, so check for the prefix that's
         // always visible.
         assert!(rendered.contains("Ctrl-M:render"));
-        assert!(!rendered.contains("# Title"));
+        // In rendered mode the heading marker gutter shows a dim '#' and
+        // the rendered text shows the heading content without ATX markers.
+        // The source `# Title` text should not appear in the document area.
+        assert!(rendered.contains("Title"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let source = rendered_buffer(&terminal);
 
         assert!(source.contains("Ctrl-M:render"));
+        // Source-peek mode renders the raw text including ATX markers.
         assert!(source.contains("# Title"));
     }
 
@@ -976,8 +1045,11 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        let selected = &buffer[(0, 1)];
-        let unselected = &buffer[(1, 1)];
+        // With a level-1 heading the marker gutter occupies 1 cell and the
+        // blank separator 1 cell, so the rendered text starts at column 2.
+        let gutter_offset: u16 = (app.max_heading_depth() + 1) as u16;
+        let selected = &buffer[(gutter_offset, 1)];
+        let unselected = &buffer[(gutter_offset + 1, 1)];
         assert_eq!(selected.symbol(), "H");
         assert_eq!(selected.bg, theme::selection_bg());
         assert_eq!(selected.fg, theme::heading_h1());
@@ -1000,8 +1072,9 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        let selected = &buffer[(0, 1)];
-        let unselected = &buffer[(1, 1)];
+        let gutter_offset: u16 = (app.max_heading_depth() + 1) as u16;
+        let selected = &buffer[(gutter_offset, 1)];
+        let unselected = &buffer[(gutter_offset + 1, 1)];
         assert_eq!(selected.symbol(), "#");
         assert_eq!(selected.bg, theme::selection_bg());
         assert_eq!(selected.fg, theme::text_primary());
@@ -1071,7 +1144,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("note.md");
         std::fs::write(&path, "abcdefgh").unwrap();
-        let backend = TestBackend::new(8, 4);
+        // +1 width to account for the 1-cell right margin.
+        let backend = TestBackend::new(9, 4);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
         app.show_headings = false;
@@ -1079,8 +1153,8 @@ mod tests {
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(
-            app.document_area.width, 8,
-            "precondition: doc area is 8 wide"
+            app.document_area.width, 9,
+            "precondition: doc area is 9 wide"
         );
 
         app.editor.move_cursor_to_char_pos(8);
@@ -1217,5 +1291,349 @@ mod tests {
         assert_eq!(tab_first.symbol(), " ");
         assert_eq!(tab_third.symbol(), " ");
         assert_eq!(b_cell.symbol(), "b");
+    }
+
+    // ── Heading gutter rendering ─────────────────────────────────────
+
+    #[test]
+    fn heading_gutter_does_not_repeat_markers_on_continuation_row_at_scroll_origin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Heading + body text long enough that at least 2 visual rows fit
+        // before the end, so document_scroll = 1 is valid.
+        std::fs::write(
+            &path,
+            "# Heading Long Title For Wrapping Test\n\n\
+             Body paragraph text that also wraps nicely here.\n\n\
+             Another paragraph for more scroll room.\n\n\
+             Yet one more to ensure scroll works.\n",
+        )
+        .unwrap();
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let visual = app.visual_document();
+        assert!(
+            visual.rows.len() >= 3,
+            "need at least 3 visual rows; got {}",
+            visual.rows.len()
+        );
+
+        let doc_x = app.document_area.x;
+        let doc_y = app.document_area.y;
+
+        // First visual row at scroll origin should have a gutter marker.
+        let gutter_cell = &buffer[(doc_x, doc_y)];
+        assert_eq!(gutter_cell.symbol(), "#");
+
+        // Second visual row is a continuation — gutter must be blank.
+        let cont_gutter = &buffer[(doc_x, doc_y + 1)];
+        assert_eq!(
+            cont_gutter.symbol(),
+            " ",
+            "continuation row gutter must be blank"
+        );
+
+        // Advance scroll so a continuation row is at the top of the viewport.
+        let max_scroll = visual
+            .rows
+            .len()
+            .saturating_sub(app.document_area.height.max(1) as usize);
+        assert!(
+            max_scroll >= 1,
+            "need scroll room; max_scroll={max_scroll} rows={} height={}",
+            visual.rows.len(),
+            app.document_area.height,
+        );
+        app.document_scroll = 1;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let cont_gutter_now_top = &buffer[(doc_x, doc_y)];
+        assert_eq!(
+            cont_gutter_now_top.symbol(),
+            " ",
+            "scrolled continuation row at top of viewport must still be blank"
+        );
+    }
+
+    #[test]
+    fn heading_gutter_shows_markers_for_heading_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Title\n\nBody text").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The gutter is at column 0 in the document area. For a level-1
+        // heading we should see a single '#' with the dim gutter style.
+        let gutter_cell = &buffer[(app.document_area.x, app.document_area.y)];
+        assert_eq!(gutter_cell.symbol(), "#");
+        assert_eq!(gutter_cell.fg, theme::text_dim());
+
+        // The blank separator follows at column 1.
+        let blank = &buffer[(app.document_area.x + 1, app.document_area.y)];
+        assert_eq!(blank.symbol(), " ");
+
+        // The rendered heading text starts at column 2 (after gutter+blank).
+        let text_cell = &buffer[(app.document_area.x + 2, app.document_area.y)];
+        assert_eq!(text_cell.symbol(), "T");
+    }
+
+    #[test]
+    fn heading_gutter_leaves_non_heading_rows_blank() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Body text\n# Heading\nMore body").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // First body row: gutter cell at column 0 should be blank.
+        let gutter_cell = &buffer[(app.document_area.x, app.document_area.y)];
+        assert_eq!(gutter_cell.symbol(), " ");
+    }
+
+    #[test]
+    fn heading_gutter_markers_adapt_to_deepest_heading() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "### Deep").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // Depth 3 → 3 gutter cells, all with '#'.
+        let doc_x = app.document_area.x;
+        let doc_y = app.document_area.y;
+        assert_eq!(buffer[(doc_x, doc_y)].symbol(), "#");
+        assert_eq!(buffer[(doc_x + 1, doc_y)].symbol(), "#");
+        assert_eq!(buffer[(doc_x + 2, doc_y)].symbol(), "#");
+        // Blank separator at column 3.
+        assert_eq!(buffer[(doc_x + 3, doc_y)].symbol(), " ");
+    }
+
+    // ── Left separator blank column ──────────────────────────────────
+
+    #[test]
+    fn left_separator_is_a_blank_cell_between_browser_and_gutter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Title\n\nBody text.").unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The left separator sits between the headings panel right border
+        // and the document area start. We assert it is blank.
+        let left_sep_x = app.document_area.x - SIDEBAR_SEP_WIDTH;
+        // Check every row of that column within the body area.
+        let body_y = app.document_area.y;
+        for row_off in 0..app.document_area.height {
+            let cell = &buffer[(left_sep_x, body_y + row_off)];
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "left sep col {left_sep_x} row {} must be blank, got {:?}",
+                body_y + row_off,
+                cell.symbol(),
+            );
+        }
+    }
+
+    // ── Right margin ─────────────────────────────────────────────────
+
+    #[test]
+    fn right_margin_leaves_last_document_column_blank() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "short").unwrap();
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The rightmost cell of the document area should be blank (margin).
+        let last_col = app.document_area.x + app.document_area.width - 1;
+        let last_cell = &buffer[(last_col, app.document_area.y)];
+        assert_eq!(last_cell.symbol(), " ");
+    }
+
+    #[test]
+    fn cursor_never_enters_right_margin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Fill enough text to fill the line completely.
+        std::fs::write(&path, "abcdefghijklmnop").unwrap();
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        // Move cursor to the last visible column in the text area and
+        // verify it does not land in the right-margin column.
+        app.editor.move_cursor_to_char_pos(0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let cursor = terminal.backend().cursor_position();
+        // document_area.width includes the margin; cursor must be < doc_area.x + doc_area.width - 1
+        assert!(cursor.x < app.document_area.x + app.document_area.width.saturating_sub(1));
+
+        // Move cursor to the last source character. The cursor must be at
+        // the last text cell, which is exactly one cell before the margin.
+        app.editor.move_cursor_to_char_pos(app.editor.text().len());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let end_cursor = terminal.backend().cursor_position();
+
+        // The last text cell is at doc_area.x + text_x_offset + text_width - 1.
+        // The margin cell at doc_area.x + doc_area.width - 1 must have no cursor.
+        let layout = app.heading_gutter_layout();
+        let margin_col = app.document_area.x + app.document_area.width - 1;
+        assert!(
+            end_cursor.x < margin_col,
+            "cursor at end must be before the right-margin column"
+        );
+        // The cursor should land past the last non-margin text column.
+        let text_end = app.document_area.x + layout.text_x_offset + layout.text_width;
+        assert!(
+            end_cursor.x <= text_end.saturating_sub(1),
+            "cursor at end x={} beyond text_end={text_end}",
+            end_cursor.x,
+        );
+    }
+
+    // ── Unicode display-width truncation ─────────────────────────────
+
+    #[test]
+    fn truncate_to_display_width_uses_cell_width_not_char_count() {
+        // CJK characters are 2 cells wide each.
+        let s = "日本語text";
+        // "日本語" = 6 cells, "text" = 4 cells → 10 cells total.
+        // Truncate to 5 display-width cells should keep "日本" (4 cells) only.
+        let result = truncate(s, 5);
+        assert!(
+            result.chars().count() <= 3,
+            "CJK chars at 2 cells each mean fewer chars fit"
+        );
+        assert!(jones_text::grapheme_display_width(&result) <= 5);
+    }
+
+    #[test]
+    fn truncate_to_display_width_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_to_display_width_zero_max() {
+        assert_eq!(truncate("hello", 0), "");
+    }
+
+    // ── Rendered Markdown styling ────────────────────────────────────
+
+    #[test]
+    fn rendered_italic_text_produces_italic_modifier_cells() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Rendered output: "x italic y" with "italic" in ITALIC.
+        std::fs::write(&path, "x *italic* y").unwrap();
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+        // source_peek is already false for .md files — be explicit.
+        assert!(!app.source_peek);
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // Compute the text region: after the heading-marker gutter (if
+        // any), before the right margin.  The right-margin column is the
+        // last column of the document area, so exclude it.
+        let layout = app.heading_gutter_layout();
+        let text_start = app.document_area.x + layout.text_x_offset;
+        let text_end = text_start + layout.text_width;
+
+        // Gather every cell in the text region that carries ITALIC.
+        let mut italic_cells: Vec<(u16, u16, String)> = Vec::new();
+        for row in app.document_area.y..app.document_area.y + app.document_area.height {
+            for col in text_start..text_end {
+                let cell = &buffer[(col, row)];
+                if cell.modifier.contains(Modifier::ITALIC) {
+                    italic_cells.push((col, row, cell.symbol().to_string()));
+                }
+            }
+        }
+
+        assert!(
+            !italic_cells.is_empty(),
+            "Expected cells with ITALIC modifier for rendered *italic*"
+        );
+        let italic_text: String = italic_cells.iter().map(|(_, _, s)| s.as_str()).collect();
+        assert_eq!(
+            italic_text, "italic",
+            "Italic-styled cells should form the word 'italic', got {italic_text:?}"
+        );
+        // The italic word should use the default text foreground (not a
+        // heading color or any other special color).
+        for (col, row, sym) in &italic_cells {
+            let cell = &buffer[(*col, *row)];
+            assert_eq!(
+                cell.fg,
+                theme::text_primary(),
+                "Italic cell {sym:?} at ({col},{row}) should use text_primary"
+            );
+        }
+
+        // ── Paired assertion: source_peek does not style source text ──
+        app.source_peek = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // In source-peek mode the source text "x *italic* y" is rendered
+        // verbatim with a uniform style (no ITALIC modifier).
+        let mut source_italic_cells: Vec<(u16, u16)> = Vec::new();
+        for row in app.document_area.y..app.document_area.y + app.document_area.height {
+            for col in text_start..text_end {
+                let cell = &buffer[(col, row)];
+                if cell.modifier.contains(Modifier::ITALIC) {
+                    source_italic_cells.push((col, row));
+                }
+            }
+        }
+        assert!(
+            source_italic_cells.is_empty(),
+            "Source-peek mode should not apply ITALIC modifier, found {} cells: {source_italic_cells:?}",
+            source_italic_cells.len(),
+        );
     }
 }

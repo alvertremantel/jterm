@@ -574,14 +574,72 @@ pub fn display_col_to_char_col(line_text: &str, display_col: usize) -> usize {
 
 pub fn truncate_to_display_width(s: &str, max_width: usize) -> &str {
     let mut width = 0;
-    for (i, c) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw > max_width {
+    for (i, grapheme) in s.grapheme_indices(true) {
+        let grapheme_width = grapheme_display_width(grapheme);
+        if width + grapheme_width > max_width {
             return &s[..i];
         }
-        width += cw;
+        width += grapheme_width;
     }
     s
+}
+
+/// Wrap text to fit within a given display width, preferring word boundaries.
+///
+/// Returns `(chunk, remainder)` where `chunk` fits within `max_width` display
+/// columns (possibly empty) and `remainder` is what is left of the input.  The
+/// function is grapheme-cluster safe: it never splits combining or ZWJ
+/// sequences.  It prefers to break at word boundaries (whitespace) but falls
+/// back to grapheme boundaries for overlong words.  Whitespace at the break
+/// point is consumed — chunks have no trailing boundary whitespace, and
+/// remainders have no leading boundary whitespace.
+///
+/// When `max_width == 0` the chunk is always empty; leading whitespace in the
+/// remainder may be consumed but non-whitespace content is preserved.
+///
+/// Repeated calls with `max_width > 0` are guaranteed to make progress: even
+/// when the first grapheme is wider than `max_width`, it is still emitted.
+pub fn wrap_text_to_display_width(s: &str, max_width: usize) -> (&str, &str) {
+    let s = s.trim_start();
+    if max_width == 0 {
+        return ("", s);
+    }
+    if s.is_empty() {
+        return ("", "");
+    }
+
+    let mut width = 0;
+    let mut last_whitespace_run: Option<(usize, usize)> = None;
+    let mut whitespace_start = None;
+
+    for (index, grapheme) in s.grapheme_indices(true) {
+        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let grapheme_width = grapheme_display_width(grapheme);
+        if width + grapheme_width > max_width {
+            if is_whitespace {
+                let chunk_end = whitespace_start.unwrap_or(index);
+                return (&s[..chunk_end], s[index..].trim_start());
+            }
+            if let Some((start, end)) = last_whitespace_run {
+                return (&s[..start], s[end..].trim_start());
+            }
+            if index == 0 {
+                let end = grapheme.len();
+                return (&s[..end], &s[end..]);
+            }
+            return (&s[..index], &s[index..]);
+        }
+
+        width += grapheme_width;
+        if is_whitespace {
+            let start = *whitespace_start.get_or_insert(index);
+            last_whitespace_run = Some((start, index + grapheme.len()));
+        } else {
+            whitespace_start = None;
+        }
+    }
+
+    (s.trim_end(), "")
 }
 
 pub fn nth_char_byte_offset(s: &str, n: usize) -> usize {
@@ -706,6 +764,9 @@ mod tests {
         assert_eq!(char_col_to_display_col(text, 2), 3);
         assert_eq!(display_col_to_char_col(text, 3), 2);
         assert_eq!(truncate_to_display_width(text, 3), "a界");
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let family_text = format!("a{family}b");
+        assert_eq!(truncate_to_display_width(&family_text, 2), "a");
         assert_eq!(nth_char_byte_offset(text, 2), "a界".len());
         assert_eq!(prev_grapheme_boundary(text, 3), 2);
         assert_eq!(next_grapheme_boundary(text, 2), 3);
@@ -780,6 +841,132 @@ mod tests {
                 r
             );
         }
+    }
+
+    // ── wrap_text_to_display_width ────────────────────────────────────────
+
+    #[test]
+    fn wrap_fit_all_content() {
+        // Everything fits within max_width.
+        assert_eq!(
+            wrap_text_to_display_width("hello world", 20),
+            ("hello world", "")
+        );
+    }
+
+    #[test]
+    fn wrap_word_boundary_break() {
+        // "hello" fits; the gap + "world" overflows → break at word boundary.
+        assert_eq!(
+            wrap_text_to_display_width("hello world", 6),
+            ("hello", "world")
+        );
+        // With wider limit that still excludes the second word.
+        assert_eq!(
+            wrap_text_to_display_width("hello world", 10),
+            ("hello", "world")
+        );
+    }
+
+    #[test]
+    fn wrap_exact_fit_before_spaces() {
+        // Word exactly fills max_width; trailing spaces consumed.
+        assert_eq!(
+            wrap_text_to_display_width("hello   world", 5),
+            ("hello", "world")
+        );
+    }
+
+    #[test]
+    fn wrap_overlong_word() {
+        // First word is too wide; broken at grapheme boundary within it.
+        assert_eq!(
+            wrap_text_to_display_width("supercalifragilistic", 10),
+            ("supercalif", "ragilistic")
+        );
+    }
+
+    #[test]
+    fn wrap_combining_grapheme_safety() {
+        // e + combining acute accent = 1 grapheme, display width 1.
+        // Never split the combining pair.
+        assert_eq!(
+            wrap_text_to_display_width("xe\u{0301}y", 2),
+            ("xe\u{0301}", "y")
+        );
+    }
+
+    #[test]
+    fn wrap_zwj_emoji_safety() {
+        // 👨‍👩‍👧 — 5 codepoints, 1 grapheme cluster, display width 2.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let text = format!("a{family}b");
+        // max_width=2: "a" (1) fits, family (2) overflows → break before it.
+        let (chunk, remainder) = wrap_text_to_display_width(&text, 2);
+        assert_eq!(chunk, "a");
+        assert!(
+            remainder.starts_with(family),
+            "remainder must start with ZWJ family"
+        );
+        assert_eq!(
+            remainder,
+            format!("{family}b"),
+            "whole suffix must be intact"
+        );
+    }
+
+    #[test]
+    fn wrap_multiple_boundary_spaces() {
+        // Multiple spaces between words — all consumed.
+        assert_eq!(
+            wrap_text_to_display_width("alpha     beta", 6),
+            ("alpha", "beta")
+        );
+    }
+
+    #[test]
+    fn wrap_zero_max_width() {
+        // max_width=0 → empty chunk, consume leading whitespace.
+        assert_eq!(
+            wrap_text_to_display_width("  hello world", 0),
+            ("", "hello world")
+        );
+        // No leading whitespace — remainder unchanged.
+        assert_eq!(
+            wrap_text_to_display_width("hello world", 0),
+            ("", "hello world")
+        );
+        // Only whitespace — everything consumed.
+        assert_eq!(wrap_text_to_display_width("   ", 0), ("", ""));
+    }
+
+    #[test]
+    fn wrap_oversized_first_grapheme() {
+        // CJK char has display width 2 > max_width 1 — still emitted.
+        assert_eq!(wrap_text_to_display_width("界xyz", 1), ("界", "xyz"));
+    }
+    #[test]
+    fn wrap_repeated_calls_progress() {
+        // Repeated calls with max_width > 0 always advance and eventually
+        // consume the entire input.
+        let mut s = "the quick brown fox jumps";
+        let max_w = 6;
+        let mut prev_len = s.len();
+        while !s.is_empty() {
+            let (chunk, remainder) = wrap_text_to_display_width(s, max_w);
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(
+                remainder.len() < prev_len,
+                "each call must advance: '{}' -> '{}'",
+                s,
+                remainder
+            );
+            prev_len = remainder.len();
+            s = remainder;
+        }
+        assert!(s.is_empty(), "all content must be consumed");
     }
 
     #[test]

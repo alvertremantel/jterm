@@ -1571,4 +1571,77 @@ mod tests {
             "line source should cover three trailing spaces"
         );
     }
+
+    // ── Style modifier tests ──────────────────────────────────────────
+
+    fn find_span<'a>(text: &'a Text<'static>, content: &str) -> Option<&'a Span<'static>> {
+        text.lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == content)
+    }
+
+    fn find_rendered_span<'a>(
+        doc: &'a RenderedDocument,
+        content: &str,
+    ) -> Option<&'a RenderedSpan> {
+        doc.lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content == content)
+    }
+
+    #[test]
+    fn plain_triple_nesting_bold_italic_strikethrough() {
+        let text = render_markdown("**bold *italic ~~and strike~~***");
+        let bold_span = find_span(&text, "bold ").expect("should find 'bold ' span");
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let italic_span = find_span(&text, "italic ").expect("should find 'italic ' span");
+        assert!(
+            italic_span
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC),
+            "text under * inside ** must have both BOLD and ITALIC"
+        );
+
+        let strike_span = find_span(&text, "and strike").expect("should find 'and strike' span");
+        assert!(
+            strike_span
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::CROSSED_OUT),
+            "deepest nested text must have all three modifiers: BOLD | ITALIC | CROSSED_OUT"
+        );
+    }
+
+    #[test]
+    fn mapped_standalone_italic_has_italic_modifier() {
+        let doc = render_markdown_mapped("*italic*");
+        let span = find_rendered_span(&doc, "italic").expect("should find italic text span");
+        assert!(
+            span.style.add_modifier.contains(Modifier::ITALIC),
+            "mapped standalone *italic* must have ITALIC modifier"
+        );
+        assert!(
+            !span.style.add_modifier.contains(Modifier::BOLD),
+            "mapped standalone *italic* must NOT have BOLD modifier"
+        );
+        assert_eq!(span.style.fg, Some(theme::text_primary()));
+    }
+
+    #[test]
+    fn mapped_triple_nesting_bold_italic_strikethrough() {
+        let doc = render_markdown_mapped("**bold *italic ~~and strike~~***");
+        let strike_span =
+            find_rendered_span(&doc, "and strike").expect("should find 'and strike' span");
+        assert!(
+            strike_span
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::CROSSED_OUT),
+            "mapped deepest nested text must have all three modifiers"
+        );
+    }
 }

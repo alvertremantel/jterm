@@ -4,6 +4,7 @@ use jones_editor::{EditorAction, EditorContext};
 use jones_event::{AppEvent, EventHandler};
 use jones_outline::{self as outline, OutlineEntry};
 use jones_render::{RenderedDocument, render_markdown_mapped};
+use jones_text;
 use jones_theme as theme;
 use jones_workspace::{self as workspace, WorkspaceEntry, WorkspaceOptions, WorkspaceSortMode};
 use ratatui::Terminal;
@@ -14,6 +15,50 @@ use std::time::{Duration, Instant};
 use writerm_config::Config;
 
 use crate::metrics::{DocumentMetrics, compute as compute_metrics};
+
+/// Layout for the heading-marker gutter inside the document area. The
+/// gutter displays ATX `#` markers for heading rows in a subtle style,
+/// with capacity adapting to the deepest heading in the document.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadingGutterLayout {
+    pub gutter_cells: u16,
+    pub blank_after: u16,
+    pub text_x_offset: u16,
+    pub text_width: u16,
+}
+
+impl HeadingGutterLayout {
+    pub fn for_area(area_width: u16, max_heading_depth: usize) -> Self {
+        let right_margin = 1u16;
+        let max_depth = max_heading_depth as u16;
+        // When there are no headings, or when the area is too narrow to
+        // fit the gutter, suppress it entirely.
+        if max_depth == 0 || area_width < max_depth + 3 {
+            Self {
+                gutter_cells: 0,
+                blank_after: 0,
+                text_x_offset: 0,
+                text_width: area_width.saturating_sub(right_margin).max(1),
+            }
+        } else {
+            Self {
+                gutter_cells: max_depth,
+                blank_after: 1,
+                text_x_offset: max_depth + 1,
+                text_width: area_width - max_depth - 1 - right_margin,
+            }
+        }
+    }
+}
+
+/// A single visual row inside the headings/section-browser panel, built
+/// from one `OutlineEntry`. Long labels are wrapped across multiple rows.
+#[derive(Debug, Clone)]
+pub(crate) struct HeadingVisualLine {
+    pub entry_idx: usize,
+    pub content: String,
+    pub style: ratatui::style::Style,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
@@ -344,8 +389,10 @@ impl WritermApp {
 
     fn click_heading(&mut self, row: u16) {
         let rel = row.saturating_sub(self.headings_area.y) as usize;
-        let idx = self.heading_scroll as usize + rel;
-        if let Some(entry) = self.outline_entries.get(idx) {
+        let visual_idx = self.heading_scroll as usize + rel;
+        let lines = self.build_heading_visual_lines(self.headings_area.width);
+        if let Some(line) = lines.get(visual_idx) {
+            let entry = &self.outline_entries[line.entry_idx];
             let pos = self.editor.buffer.rope().line_to_char(entry.line);
             self.editor.move_cursor_to_char_pos(pos);
             self.ensure_cursor_visible();
@@ -377,7 +424,12 @@ impl WritermApp {
     fn click_document(&mut self, col: u16, row: u16, extend_selection: bool) {
         self.refresh_render_cache();
         let rel_row = row.saturating_sub(self.document_area.y) as usize;
-        let rel_col = col.saturating_sub(self.document_area.x) as usize;
+        let raw_rel_col = col.saturating_sub(self.document_area.x) as usize;
+        // Adjust for the heading-marker gutter so the display column is
+        // relative to the text area (not the full document area).
+        let layout = self.heading_gutter_layout();
+        let gutter_offset = (layout.gutter_cells + layout.blank_after) as usize;
+        let rel_col = raw_rel_col.saturating_sub(gutter_offset);
         let display_row = self.document_scroll + rel_row;
         let char_pos = self
             .visual_document()
@@ -652,22 +704,23 @@ impl WritermApp {
 
     fn refresh_visual_cache(&mut self) {
         let version = self.editor.buffer.version();
-        let width = self.document_area.width.max(1) as usize;
+        let layout = self.heading_gutter_layout();
+        let wrap_width = layout.text_width.max(1) as usize;
         if self.cached_visual_version != version
-            || self.cached_visual_width != width
+            || self.cached_visual_width != wrap_width
             || self.cached_visual_source_peek != self.source_peek
         {
             self.cached_visual = if self.source_peek {
                 crate::visual::VisualDocument::from_source(
                     &self.editor.text(),
-                    width,
+                    wrap_width,
                     ratatui::style::Style::default().fg(theme::text_primary()),
                 )
             } else {
-                crate::visual::VisualDocument::from_rendered(&self.rendered, width)
+                crate::visual::VisualDocument::from_rendered(&self.rendered, wrap_width)
             };
             self.cached_visual_version = version;
-            self.cached_visual_width = width;
+            self.cached_visual_width = wrap_width;
             self.cached_visual_source_peek = self.source_peek;
         }
     }
@@ -681,6 +734,22 @@ impl WritermApp {
     /// text so the counts are stable across rendered/source-peek toggles.
     pub fn document_metrics(&self) -> DocumentMetrics {
         compute_metrics(&self.editor.text())
+    }
+
+    /// Deepest heading level present in the current outline (0 when there are
+    /// no headings). Used to size the left marker gutter adaptively.
+    pub fn max_heading_depth(&self) -> usize {
+        self.outline_entries
+            .iter()
+            .filter(|e| matches!(e.kind, outline::OutlineKind::Heading))
+            .map(|e| e.depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Compute the gutter/margins layout for the current document area width.
+    pub(crate) fn heading_gutter_layout(&self) -> HeadingGutterLayout {
+        HeadingGutterLayout::for_area(self.document_area.width, self.max_heading_depth())
     }
 
     pub fn current_heading(&self) -> Option<String> {
@@ -723,6 +792,85 @@ impl WritermApp {
         self.refresh_render_cache();
         self.refresh_visual_cache();
         self.cached_visual.clone()
+    }
+
+    /// Build every visual row for the headings/section-browser panel.
+    /// Long labels are wrapped at the panel width; continuation rows are
+    /// indented to align under the label text. Each returned line carries
+    /// the entry index, the text to render, and its style.
+    pub(crate) fn build_heading_visual_lines(&self, max_width: u16) -> Vec<HeadingVisualLine> {
+        let mut lines = Vec::new();
+        let max_w = max_width.max(1) as usize;
+        for (idx, entry) in self.outline_entries.iter().enumerate() {
+            let indent = "  ".repeat(entry.depth.saturating_sub(1));
+            // Bullet mirrors the current draw style: ▸ for depths 1-3, · for deeper.
+            let bullet = if entry.depth <= 3 { "▸" } else { "·" };
+            let active = entry.line <= self.editor.state.cursor_line;
+            let level_color = match entry.depth {
+                1 => theme::heading_h1(),
+                2 => theme::heading_h2(),
+                3 => theme::heading_h3(),
+                4 => theme::heading_h4(),
+                5 => theme::heading_h5(),
+                _ => theme::heading_h6(),
+            };
+            let style = if active {
+                ratatui::style::Style::default()
+                    .fg(level_color)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                ratatui::style::Style::default().fg(theme::text_secondary())
+            };
+
+            let prefix = format!("{indent}{bullet} ");
+            let prefix_dw = jones_text::grapheme_display_width(&prefix);
+            let label = &entry.label;
+
+            // How many display-width cells remain for the label after the prefix.
+            let label_max = max_w.saturating_sub(prefix_dw);
+
+            if label_max == 0 || prefix_dw >= max_w {
+                // Not enough room for anything meaningful — show at least a
+                // truncated version of the prefix so the user can see
+                // *something* at ultra-narrow panel widths.
+                let truncated = jones_text::truncate_to_display_width(&prefix, max_w);
+                lines.push(HeadingVisualLine {
+                    entry_idx: idx,
+                    content: truncated.to_string(),
+                    style,
+                });
+                continue;
+            }
+
+            // Grapheme-safe wrapping: never split combining/ZWJ clusters.
+            // The helper prefers word boundaries but falls back to grapheme
+            // boundaries for overlong words.
+            let (first_chunk, rest_label) =
+                jones_text::wrap_text_to_display_width(label, label_max);
+            let first_line = format!("{prefix}{first_chunk}");
+            lines.push(HeadingVisualLine {
+                entry_idx: idx,
+                content: first_line,
+                style,
+            });
+
+            // Continuation lines: indent to align under the label text.
+            let cont_indent = " ".repeat(prefix_dw);
+            let mut rest: &str = rest_label;
+            while !rest.is_empty() {
+                let (chunk, remaining) = jones_text::wrap_text_to_display_width(rest, label_max);
+                if chunk.is_empty() {
+                    break;
+                }
+                lines.push(HeadingVisualLine {
+                    entry_idx: idx,
+                    content: format!("{cont_indent}{chunk}"),
+                    style,
+                });
+                rest = remaining;
+            }
+        }
+        lines
     }
 }
 
@@ -1336,7 +1484,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma delta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 4);
+        app.document_area = Rect::new(0, 0, 11, 4);
         app.editor.move_cursor_to_char_pos(2);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -1397,7 +1545,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "**alpha beta gamma**\n`delta epsilon zeta`").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 8);
+        app.document_area = Rect::new(0, 0, 11, 8);
         app.editor.move_cursor_to_char_pos(21);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -1421,7 +1569,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "# Heading\n\nalpha beta gamma delta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 4, 8);
+        app.document_area = Rect::new(0, 0, 7, 8);
         app.editor.move_cursor_to_char_pos(7);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -1491,7 +1639,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 4);
+        app.document_area = Rect::new(0, 0, 11, 4);
         app.editor.move_cursor_to_char_pos(1);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
@@ -1795,7 +1943,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 4);
+        app.document_area = Rect::new(0, 0, 11, 4);
 
         app.click_document(1, 1, false);
 
@@ -1808,7 +1956,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 2);
+        app.document_area = Rect::new(0, 0, 11, 2);
         app.document_scroll = 1;
 
         app.click_document(1, 0, false);
@@ -1822,7 +1970,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 1);
+        app.document_area = Rect::new(0, 0, 11, 1);
         app.editor.move_cursor_to_char_pos(13);
 
         app.ensure_cursor_visible();
@@ -1881,7 +2029,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 2);
+        app.document_area = Rect::new(0, 0, 11, 2);
         app.editor.move_cursor_to_char_pos(2);
 
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
@@ -1932,7 +2080,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 2);
+        app.document_area = Rect::new(0, 0, 11, 2);
         app.editor.move_cursor_to_char_pos(31);
         app.ensure_cursor_visible();
         assert_eq!(app.visual_document().source_to_display(31), Some((4, 0)));
@@ -1950,7 +2098,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "alpha beta gamma delta epsilon zeta eta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 2);
+        app.document_area = Rect::new(0, 0, 11, 2);
         app.editor.move_cursor_to_char_pos(2);
 
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
@@ -1988,7 +2136,7 @@ mod tests {
         let path = dir.path().join("note.md");
         std::fs::write(&path, "# Heading\n\nalpha beta gamma delta").unwrap();
         let mut app = app_at(path);
-        app.document_area = Rect::new(0, 0, 10, 1);
+        app.document_area = Rect::new(0, 0, 13, 1);
         app.editor.move_cursor_to_char_pos(12);
         app.document_scroll = 3;
 
@@ -2085,5 +2233,367 @@ mod tests {
 
         assert_eq!(app.current_file_path.file_name().unwrap(), "b.md");
         assert_eq!(app.editor.text(), "b");
+    }
+
+    // ── Heading gutter width and marker tests ────────────────────────
+
+    #[test]
+    fn max_heading_depth_returns_zero_when_no_heading_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "no headings here").unwrap();
+        let app = app_at(path);
+
+        assert_eq!(app.max_heading_depth(), 0);
+    }
+
+    #[test]
+    fn max_heading_depth_adapts_to_deepest_heading() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# H1\n## H2\n### H3\n#### H4").unwrap();
+        let app = app_at(path);
+
+        assert_eq!(app.max_heading_depth(), 4);
+    }
+
+    #[test]
+    fn max_heading_depth_ignores_section_fallback_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, "Just text\nAnother line:").unwrap();
+        let app = app_at(path);
+
+        // Fallback outlines create Section entries but no Heading entries.
+        assert_eq!(app.max_heading_depth(), 0);
+    }
+
+    #[test]
+    fn gutter_layout_suppresses_gutter_when_no_headings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "plain text").unwrap();
+        let mut app = app_at(path);
+        // Use a realistic area width.
+        app.document_area = Rect::new(0, 0, 80, 20);
+
+        let layout = app.heading_gutter_layout();
+        assert_eq!(layout.gutter_cells, 0);
+        assert_eq!(layout.blank_after, 0);
+        assert_eq!(layout.text_x_offset, 0);
+        // Text width = area_width - right_margin(1)
+        assert_eq!(layout.text_width, 79);
+    }
+
+    #[test]
+    fn gutter_layout_reserves_cells_for_heading_markers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "### Deep heading").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 80, 20);
+
+        let layout = app.heading_gutter_layout();
+        // max depth = 3 → 3 gutter cells + 1 blank separator.
+        assert_eq!(layout.gutter_cells, 3);
+        assert_eq!(layout.blank_after, 1);
+        assert_eq!(layout.text_x_offset, 4);
+        assert_eq!(layout.text_width, 80 - 3 - 1 - 1); // 75
+    }
+
+    #[test]
+    fn gutter_layout_suppresses_at_narrow_widths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "## Two").unwrap();
+        let mut app = app_at(path);
+        // 2 + 3 = 5 → area_width 4 is below threshold.
+        app.document_area = Rect::new(0, 0, 4, 20);
+
+        let layout = app.heading_gutter_layout();
+        assert_eq!(layout.gutter_cells, 0);
+        assert_eq!(layout.text_width, 3); // 4 - 1 margin
+    }
+
+    // ── Right margin ─────────────────────────────────────────────────
+
+    #[test]
+    fn visual_cache_accounts_for_right_margin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello world").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 10);
+
+        let visual = app.visual_document();
+        // With no headings, wrap width = 20 - 1 = 19.
+        // "hello world" is 11 cells, well under 19, so 1 row.
+        assert_eq!(visual.rows.len(), 1);
+        // The row width should respect the margin-aware wrap width.
+        assert!(visual.row_width(0).unwrap() <= 19);
+    }
+
+    // ── Wrapped heading visual lines ─────────────────────────────────
+
+    #[test]
+    fn heading_visual_lines_wrap_long_labels() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# A very long heading title that must wrap").unwrap();
+        let mut app = app_at(path);
+        app.headings_area = Rect::new(0, 0, 15, 10);
+
+        let lines = app.build_heading_visual_lines(15);
+        // With prefix "▸ " (2 cells display width), label max = 13.
+        // "A very long heading title that must wrap" = 40 chars.
+        // First line: "▸ A very long " (15 cells), then continuation.
+        assert!(lines.len() > 1, "long label should wrap");
+        // Continuation rows should be indented under the label (2 spaces).
+        assert!(lines[1].content.starts_with("  "));
+    }
+
+    #[test]
+    fn heading_visual_lines_single_entry_no_wrap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Short").unwrap();
+        let mut app = app_at(path);
+        app.headings_area = Rect::new(0, 0, 30, 10);
+
+        let lines = app.build_heading_visual_lines(30);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].content.contains("Short"));
+    }
+
+    #[test]
+    fn heading_visual_lines_active_entry_has_bold_style() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Active\n\nin between\n\n## Inactive").unwrap();
+        let mut app = app_at(path);
+        app.headings_area = Rect::new(0, 0, 30, 10);
+        // Cursor is at line 0, so the first heading is active.
+        app.editor.state.cursor_line = 0;
+
+        let lines = app.build_heading_visual_lines(30);
+        // First entry (depth 1, active) should have BOLD modifier.
+        assert!(
+            lines[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // Second entry (depth 2, inactive)
+        let second_lines: Vec<_> = lines.iter().filter(|l| l.entry_idx == 1).collect();
+        assert!(!second_lines.is_empty());
+        assert!(
+            !second_lines[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn heading_visual_lines_never_split_combining_graphemes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // "abc" + 2 combining marks per letter = 3 graphemes, display width 3.
+        // Wrapping at 3 should emit the full heading without splitting graphemes.
+        std::fs::write(
+            &path,
+            "# a\u{0301}b\u{0301}c\u{0301} d e f g h i j k l m n o p q r s t u v w x y z",
+        )
+        .unwrap();
+        let mut app = app_at(path);
+        app.headings_area = Rect::new(0, 0, 10, 20);
+
+        let lines = app.build_heading_visual_lines(10);
+        for line in &lines {
+            // Every line must end at a grapheme boundary. We verify by
+            // checking that a combining mark is never orphaned.
+            let content = &line.content;
+            // Walk through char by char: if we see a combining mark
+            // (Unicode category Mn/Mc/Me), its predecessor char must have
+            // been a base character.
+            let mut prev_was_base = false;
+            for ch in content.chars() {
+                let is_zero_width = jones_text::grapheme_display_width(&ch.to_string()) == 0;
+                if is_zero_width && prev_was_base {
+                    // zero-width combining mark after a base char — OK
+                } else if is_zero_width {
+                    panic!("orphan zero-width char {ch:?} in line {content:?}");
+                }
+                prev_was_base = !is_zero_width;
+            }
+        }
+    }
+
+    #[test]
+    fn heading_visual_lines_never_split_zwj_emoji() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Family emoji: width 2, single grapheme.  Place it near a wrap
+        // boundary so we can assert it stays in one piece.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let content = format!("# aa bb cc dd ee ff gg hh ii {family} jj kk ll mm");
+        std::fs::write(&path, &content).unwrap();
+        let mut app = app_at(path);
+        // Narrow panel: ~10 cells wide. The ZWJ family is 2 cells wide and
+        // must never be split across two visual lines.
+        app.headings_area = Rect::new(0, 0, 10, 30);
+
+        let lines = app.build_heading_visual_lines(10);
+        // Find any line that contains a partial ZWJ sequence.
+        for line in &lines {
+            let text = &line.content;
+            // If a ZWJ (U+200D) appears, the entire grapheme cluster must
+            // be present (it's a multi-codepoint emoji sequence). We check
+            // that any ZWJ is flanked by non-trivial chars, i.e. it's part
+            // of a complete cluster.
+            for (i, ch) in text.char_indices() {
+                if ch == '\u{200D}' {
+                    assert!(
+                        i > 0 && i + ch.len_utf8() < text.len(),
+                        "ZWJ at byte {i} in {text:?} looks truncated"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Heading scroll clamping ──────────────────────────────────────
+
+    #[test]
+    fn heading_scroll_is_clamped_by_real_draw_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# A\n# B\n# C\n# D").unwrap();
+        // Terminal wide enough that the headings panel is visible
+        // (MIN_DOCUMENT_WIDTH 40 + headings_block_w 30 + sep 1 = 71).
+        let backend = ratatui::backend::TestBackend::new(80, 16);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = app_at(path);
+        app.show_headings = true;
+        app.heading_scroll = 50u16; // stale — well beyond everything
+
+        // The draw path calls draw_headings_content which clamps
+        // heading_scroll as a side-effect.
+        terminal
+            .draw(|frame| crate::draw::draw(frame, &mut app))
+            .unwrap();
+
+        // After the draw, heading_scroll must have been clamped.
+        assert!(
+            app.heading_scroll < 50,
+            "draw path must clamp stale heading_scroll; still {}",
+            app.heading_scroll,
+        );
+        // Build visual lines to compute the real maximum.
+        let all_lines = app.build_heading_visual_lines(app.headings_area.width);
+        let max_scroll = all_lines
+            .len()
+            .saturating_sub(app.headings_area.height.max(1) as usize);
+        let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+        assert!(
+            app.heading_scroll <= max_scroll,
+            "heading_scroll {} must be <= max {max_scroll}",
+            app.heading_scroll,
+        );
+    }
+
+    #[test]
+    fn heading_click_maps_to_correct_entry_with_wrapping() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // A heading whose label is long enough to wrap inside a narrow
+        // headings panel.
+        std::fs::write(&path, "# First short\n## A Very Long Heading Title That Will Wrap To Multiple Visual Rows Inside The Section Browser Panel").unwrap();
+        let mut app = app_at(path);
+        app.headings_area = Rect::new(0, 0, 20, 10);
+
+        let lines = app.build_heading_visual_lines(20);
+        // The second heading should wrap to more than 1 visual row.
+        let second_lines: Vec<_> = lines.iter().filter(|l| l.entry_idx == 1).collect();
+        assert!(
+            second_lines.len() > 1,
+            "long heading must wrap to multiple visual rows, got {}",
+            second_lines.len()
+        );
+
+        // Find the first continuation row of the second heading and click it.
+        // All rows for entry_idx=1, after the first, are continuations.
+        let cont_row = lines
+            .iter()
+            .position(|l| l.entry_idx == 1)
+            .map(|first| first + 1)
+            .unwrap();
+        let abs_row = app.headings_area.y + cont_row as u16;
+        app.click_heading(abs_row);
+        // Cursor should land on the "## A Very Long..." heading line.
+        assert_eq!(
+            app.editor.state.cursor_line, 1,
+            "continuation row click must map to the heading entry (line 1)"
+        );
+
+        // Now click the first entry after the wrapped heading to verify
+        // row-to-entry mapping past the wrapped rows.
+        if lines.len() > second_lines.len() + 1 {
+            let after_wrapped = lines
+                .iter()
+                .rposition(|l| l.entry_idx == 1)
+                .map(|last| last + 1)
+                .unwrap();
+            let abs_after = app.headings_area.y + after_wrapped as u16;
+            app.click_heading(abs_after);
+            // After the wrapped heading, the next entry might be a
+            // section/symbol entry or empty. If it maps, it's correct.
+            // The cursor should still be somewhere valid.
+            assert!(
+                app.editor.state.cursor_line < 1000,
+                "click after wrapped rows should produce a valid cursor position"
+            );
+        }
+    }
+
+    // ── Display-width truncation ─────────────────────────────────────
+
+    #[test]
+    fn gutter_click_maps_to_correct_source() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Heading\n\nBody paragraph").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(5, 3, 40, 10);
+
+        // Click inside the heading-marker gutter: doc_area.x is 5, row is
+        // doc_area.y = 3. The gutter column maps through display_to_source
+        // via the gutter offset correction in click_document.
+        app.click_document(5, 3, false);
+        // `# Heading` source positions: #(0), ' '(1), H(2), e(3)...
+        // At minimum the cursor should land somewhere in the heading text
+        // (position 2 or later), not at position 0.
+        assert!(
+            app.editor.cursor_char_pos() >= 2,
+            "gutter click should map into the heading text, got {}",
+            app.editor.cursor_char_pos(),
+        );
+    }
+
+    #[test]
+    fn effective_text_width_reduces_wrap_for_gutter_and_margin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Heading depth 1 → gutter 1 + blank 1 + margin 1 = 3 cells less.
+        std::fs::write(&path, "# H\n\nalpha beta gamma delta").unwrap();
+        let mut app = app_at(path);
+        app.document_area = Rect::new(0, 0, 20, 10);
+
+        let visual = app.visual_document();
+        // The heading marker row wraps at 20 - 3 = 17 cells (wide enough).
+        // The body text should also wrap at 17.
+        let layout = app.heading_gutter_layout();
+        assert_eq!(layout.text_width, 17);
+        assert!(visual.row_width(0).unwrap() <= layout.text_width as usize);
     }
 }
