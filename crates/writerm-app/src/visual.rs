@@ -29,6 +29,12 @@ pub struct VisualRow {
     source_start: usize,
     source_end: usize,
     mapped: bool,
+    /// Number of leading display cells that are visual-only (synthetic
+    /// indent).  `source_to_display` skips these cells so the cursor
+    /// lands at the first text character rather than in the indent.
+    /// `display_to_source` for `col < prefix_width` maps to
+    /// `source_start`.  Zero when there is no synthetic indent.
+    prefix_width: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +171,30 @@ impl VisualDocument {
         self.rows.get(row).map(VisualRow::width)
     }
 
+    /// How many leading visual-only cells this row has (the synthetic
+    /// indent prefix).  Horizontal navigation treats these cells as a
+    /// virtual boundary: pressing Left at `prefix_width` jumps to the
+    /// previous row instead of entering the indent.
+    pub fn row_prefix_width(&self, row: usize) -> Option<usize> {
+        self.rows.get(row).map(|r| r.prefix_width)
+    }
+
+    /// Returns the `source_end` of the nearest previous mapped visual
+    /// row IF that row is indented prose (has a synthetic prefix).
+    /// Returns `None` when there is no previous mapped row, or when the
+    /// previous row is structural (heading, list, code, blank line, or a
+    /// wrapping continuation row).  Used by the Backspace handler to
+    /// avoid atomically deleting across structural boundaries.
+    pub fn prev_prose_row_end(&self, row: usize) -> Option<usize> {
+        let prev = (0..row)
+            .rev()
+            .find(|&r| self.rows.get(r).is_some_and(|vr| vr.mapped))?;
+        if self.rows[prev].prefix_width == 0 {
+            return None;
+        }
+        Some(self.rows[prev].source_end)
+    }
+
     pub fn is_word_at_display_col(&self, row: usize, col: usize) -> bool {
         self.rows
             .get(row)
@@ -188,17 +218,25 @@ impl VisualDocument {
         closest
     }
 
-    /// Apply a 2-space visual indent to the first visual row of each
-    /// ordinary prose paragraph. Structural rows (headings, lists,
-    /// blockquotes, fenced code, thematic rules, blank lines) and already-
-    /// indented rows are left alone. The indent inserts visual-only cells
-    /// that map back to the row's `source_start` so cursor navigation and
-    /// click-to-position continue to work without violating source-byte
-    /// mappings.
+    /// Apply a 2-cell visual indent prefix to the first visual row of
+    /// each ordinary prose paragraph.  The indent is purely visual:
+    /// `source_to_display` skips the prefix cells so the cursor lands at
+    /// the first text character, while `display_to_source` (clicks) in
+    /// the prefix region maps to the physical source-line start.
+    ///
+    /// Excluded: headings, lists, blockquotes, fenced code blocks,
+    /// CommonMark indented code blocks (tab/≥4-space lines preceded by a
+    /// blank line), thematic rules, blank lines, and wrapping
+    /// continuation rows.
+    ///
+    /// Source lines that already have leading whitespace (tabs, spaces)
+    /// still receive the uniform 2-cell prefix — the rendered-mode
+    /// pipeline strips the source whitespace first, so every paragraph
+    /// start looks consistent regardless of how the author indented the
+    /// source.
     ///
     /// Line boundaries are precomputed once as byte ranges so the per-row
-    /// cost is O(log lines) — typically ~12 comparisons for a 4000-line
-    /// document.
+    /// cost is O(log lines).
     pub fn apply_first_line_indent(&mut self, source_text: &str) {
         let info = build_indent_line_info(source_text);
         if info.byte_bounds.is_empty() {
@@ -219,9 +257,33 @@ impl VisualDocument {
             if info.in_fence.get(source_line).copied().unwrap_or(false) {
                 continue;
             }
+            // Never indent content inside CommonMark indented code blocks
+            // (tab or ≥4-space prefixed lines following a blank line).
+            if info
+                .in_indented_code
+                .get(source_line)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let line_text = slice_line(source_text, &info, source_line);
             if is_prose_paragraph(line_text) {
-                row.prepend_indent(2);
+                // Use the physical source line start for the indent
+                // mapping, NOT row.source_start.  Rendered-mode trimming
+                // may have stripped leading whitespace cells, shifting
+                // the row's source_start forward past the original line
+                // start (e.g. past a tab character).  The indent must map
+                // to the true first source character of the line.
+                let line_char_start = info.char_starts[source_line];
+                // Also ensure source_start encompasses the indent prefix
+                // so source_to_display can find the indent's source
+                // position (which is before the trimmed start).
+                row.source_start = row.source_start.min(line_char_start);
+                // Inherit the row's text style so the indent prefix
+                // blends with the prose text rather than standing out.
+                let text_style = row.spans.first().map(|s| s.style).unwrap_or_default();
+                row.prepend_indent(2, line_char_start, text_style);
             }
         }
     }
@@ -239,6 +301,7 @@ impl VisualRow {
             source_start,
             source_end,
             mapped: true,
+            prefix_width: 0,
         }
     }
 
@@ -249,6 +312,7 @@ impl VisualRow {
             source_start: 0,
             source_end: 0,
             mapped: false,
+            prefix_width: 0,
         }
     }
 
@@ -297,6 +361,7 @@ impl VisualRow {
             source_start,
             source_end,
             mapped: true,
+            prefix_width: 0,
         }
     }
 
@@ -308,7 +373,7 @@ impl VisualRow {
         self.source_end = self.source_end.max(source);
     }
 
-    fn to_line(&self) -> Line<'static> {
+    pub(crate) fn to_line(&self) -> Line<'static> {
         Line::from(
             self.spans
                 .iter()
@@ -412,9 +477,9 @@ impl VisualRow {
     }
 
     fn col_for_source(&self, char_pos: usize) -> usize {
-        let mut best_col = 0usize;
+        let mut best_col = self.prefix_width;
         let mut prev_source = usize::MAX;
-        for (col, &source) in self.col_sources.iter().enumerate() {
+        for (col, &source) in self.col_sources.iter().enumerate().skip(self.prefix_width) {
             if source == char_pos {
                 return col;
             }
@@ -435,23 +500,32 @@ impl VisualRow {
     }
 
     /// Prepend `width` blank cells to the front of this row. Every new
-    /// cell maps back to `source_start` so the cursor can address the
-    /// indent region and land at the start of the prose line. The prefix
-    /// span carries no style (Style::default) so it inherits whatever the
-    /// drawing layer provides — typically the same background as the
-    /// surrounding document surface.
-    fn prepend_indent(&mut self, width: usize) {
+    /// cell maps back to `source_pos` so display→source lookups
+    /// (e.g. clicks) in the indent resolve correctly.  The cells are
+    /// marked as a *non-addressable visual prefix*: `source_to_display`
+    /// skips past them so the cursor lands at the first text character
+    /// rather than inside the indent.
+    ///
+    /// `source_pos` should be the character offset of the first source
+    /// character of the physical line, which may differ from the row's
+    /// `source_start` when the rendered-mode pipeline has stripped
+    /// leading whitespace (e.g. tab expansions).
+    ///
+    /// `style` is inherited from the row's first text span so the indent
+    /// blends with the surrounding prose rather than using a bare default.
+    fn prepend_indent(&mut self, width: usize, source_pos: usize, style: Style) {
         let prefix = " ".repeat(width);
         self.spans.insert(
             0,
             VisualSpan {
                 content: prefix,
-                style: Style::default(),
+                style,
             },
         );
         for i in 0..width {
-            self.col_sources.insert(i, self.source_start);
+            self.col_sources.insert(i, source_pos);
         }
+        self.prefix_width += width;
     }
 }
 
@@ -699,6 +773,11 @@ struct IndentLineInfo {
     /// (between an opening `` ``` `` / ``~~~`` and its matching closing
     /// fence).  Content lines inside a fence never receive a prose indent.
     in_fence: Vec<bool>,
+    /// `true` when this physical line is part of a CommonMark indented
+    /// code block (starts with a tab or ≥4 spaces, preceded by a blank
+    /// line or another indented-code-block line).  These lines must not
+    /// receive a paragraph indent.
+    in_indented_code: Vec<bool>,
 }
 
 fn build_indent_line_info(source_text: &str) -> IndentLineInfo {
@@ -740,10 +819,14 @@ fn build_indent_line_info(source_text: &str) -> IndentLineInfo {
     // Second pass: mark lines that live inside fenced code blocks.
     let in_fence = mark_fence_lines(source_text, &byte_bounds);
 
+    // Third pass: mark lines that are part of indented code blocks.
+    let in_indented_code = mark_indented_code_lines(source_text, &byte_bounds);
+
     IndentLineInfo {
         byte_bounds,
         char_starts,
         in_fence,
+        in_indented_code,
     }
 }
 
@@ -830,6 +913,60 @@ fn is_fence_marker(trimmed: &str, fence_char: char) -> bool {
     fence_char_from_line(trimmed) == Some(fence_char)
 }
 
+/// Mark physical lines that are part of CommonMark **indented code
+/// blocks**.  An indented code block starts on a line that begins with
+/// a tab or at least four spaces, following a blank line (or at the
+/// start of the document).  Once inside, consecutive tab/4+-space
+/// lines continue the block.  A blank line ends it.
+///
+/// Prose continuation lines (e.g. the barrens fixture — tab-prefixed
+/// lines within the same paragraph, separated only by a soft break)
+/// are NOT marked because they are not preceded by a blank line.
+fn mark_indented_code_lines(source_text: &str, byte_bounds: &[(usize, usize)]) -> Vec<bool> {
+    let mut result = vec![false; byte_bounds.len()];
+    let mut in_code: bool = false;
+    let bytes = source_text.as_bytes();
+
+    for (i, &(start, end)) in byte_bounds.iter().enumerate() {
+        let content = &bytes[start..end];
+        let is_blank = content.iter().all(|&b| b.is_ascii_whitespace());
+
+        if is_blank {
+            in_code = false;
+            // Blank lines are never prose — leave `false`.
+            continue;
+        }
+
+        let starts_with_indent = content.starts_with(b"\t")
+            || (content.len() >= 4 && content[..4].iter().all(|&b| b == b' '));
+
+        if starts_with_indent {
+            if in_code {
+                // Continuing an existing indented code block.
+                result[i] = true;
+            } else if i > 0 {
+                // A tab/space-prefixed line is an indented code block
+                // only when preceded by a blank line.  The first line of
+                // the document (i == 0) cannot be preceded by a blank,
+                // so we treat it as prose.
+                let (ps, pe) = byte_bounds[i - 1];
+                let prev_is_blank = bytes[ps..pe].iter().all(|&b| b.is_ascii_whitespace());
+                if prev_is_blank {
+                    in_code = true;
+                    result[i] = true;
+                }
+                // Otherwise: tab/space-prefixed line following non-blank
+                // prose → prose continuation, NOT a code block.
+            }
+            // i == 0 with indent: not a code block (no preceding blank).
+        } else {
+            // Non-blank, not indented → ends any indented code block.
+            in_code = false;
+        }
+    }
+    result
+}
+
 /// Binary search `info.char_starts` for the line whose content contains
 /// `char_pos`.  Returns a valid line index.
 fn line_for_char_pos(info: &IndentLineInfo, char_pos: usize) -> usize {
@@ -850,14 +987,15 @@ fn slice_line<'a>(source_text: &'a str, info: &IndentLineInfo, line_idx: usize) 
 /// Returns `true` when `line` looks like an ordinary prose paragraph
 /// that should receive a first-line visual indent. Structural lines
 /// (headings, lists, blockquotes, fenced code, thematic rules, table
-/// rows, blank lines) and already-indented lines are excluded.
+/// rows, blank lines) are excluded.
+///
+/// Lines that already have source-leading whitespace (tabs, spaces) are
+/// still classified as prose: their leading whitespace is stripped during
+/// `from_cells` in rendered mode and then replaced with a uniform visual
+/// indent so every paragraph start looks consistent.
 fn is_prose_paragraph(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return false;
-    }
-    // Leading whitespace suggests the user already indented.
-    if line.starts_with(' ') || line.starts_with('\t') {
         return false;
     }
     // Table rows (pipe-delimited).
@@ -1138,13 +1276,14 @@ mod tests {
         let mut doc = doc;
         doc.apply_first_line_indent("hello world");
 
-        // The two indent cells map to source_start (0).
+        // The two indent cells map to source_start (0) for clicks.
         assert_eq!(doc.display_to_source(0, 0), Some(0));
         assert_eq!(doc.display_to_source(0, 1), Some(0));
         // The third display cell is the start of the actual text.
         assert_eq!(doc.display_to_source(0, 2), Some(0)); // first char "h"
-        // source_to_display at position 0 should return col 0 (on indent).
-        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        // source_to_display skips the visual prefix, so source_start
+        // (position 0) maps to the first text character at col 2.
+        assert_eq!(doc.source_to_display(0), Some((0, 2)));
         // source_to_display at position 5 (" " after hello) should return
         // the cell just after "hello", shifted by 2 for the indent.
         assert_eq!(doc.source_to_display(5), Some((0, 7)));
@@ -1248,12 +1387,12 @@ mod tests {
         let mut doc = VisualDocument::from_rendered(&rendered, 40);
         doc.apply_first_line_indent("Paragraph one.\n\n# Heading\n\nParagraph two.");
 
-        // "Paragraph one." — source pos 0 maps to col 0 (on the indent
-        // cells, which map back to source_start=0).
-        assert_eq!(doc.source_to_display(0), Some((0, 0)));
-        // Cursor at the actual 'P' character (source position 0) also
-        // maps to col 0 because the indent maps to the same source pos.
+        // "Paragraph one." — source pos 0 maps to col 2 (after the prefix),
+        // because source_to_display skips the visual indent prefix.
+        assert_eq!(doc.source_to_display(0), Some((0, 2)));
+        // Clicks in the indent prefix (cols 0-1) still map to source_start.
         assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(0, 1), Some(0));
         // The text area starts at col 2; clicking there still maps to
         // source pos 0.
         assert_eq!(doc.display_to_source(0, 2), Some(0));
@@ -1326,9 +1465,11 @@ mod tests {
     }
 
     #[test]
-    fn is_prose_paragraph_rejects_already_indented() {
-        assert!(!is_prose_paragraph("    indented"));
-        assert!(!is_prose_paragraph("\tindented"));
+    fn is_prose_paragraph_accepts_already_indented() {
+        // Source-indented lines are still prose — the rendered-mode
+        // visual pipeline strips and normalises the whitespace.
+        assert!(is_prose_paragraph("    indented"));
+        assert!(is_prose_paragraph("\tindented"));
     }
 
     #[test]
@@ -1414,6 +1555,317 @@ mod tests {
         assert!(
             outro_row.to_line().to_string().starts_with("  Outro"),
             "prose after tilde fence should be indented"
+        );
+    }
+
+    // Regression: tab-indented paragraph indent (FIX VERIFICATION)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Consecutive tab-prefixed source lines all show exactly one visual
+    /// indent (2-space prefix).  Models the barrens-e2 fixture pattern.
+    #[test]
+    fn consecutive_tab_prefixed_lines_all_show_indent() {
+        let input = "First paragraph.\n\tSecond tab-indented.\n\tThird tab-indented.";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 60);
+        doc.apply_first_line_indent(input);
+
+        // All three prose rows should start with a 2-space indent prefix.
+        assert!(
+            doc.rows[0].to_line().to_string().starts_with("  First"),
+            "row 0 must have indent"
+        );
+        assert!(
+            doc.rows[1].to_line().to_string().starts_with("  Second"),
+            "row 1 must have indent"
+        );
+        assert!(
+            doc.rows[2].to_line().to_string().starts_with("  Third"),
+            "row 2 must have indent"
+        );
+        // Each row has prefix_width == 2.
+        assert_eq!(doc.row_prefix_width(0), Some(2));
+        assert_eq!(doc.row_prefix_width(1), Some(2));
+        assert_eq!(doc.row_prefix_width(2), Some(2));
+    }
+
+    /// Space-prefixed lines also get uniform visual indent (normalised
+    /// from whatever space count the source uses).
+    #[test]
+    fn space_prefixed_lines_get_normalised_indent() {
+        let input = "First.\n    Second (4 spaces).\n  Third (2 spaces).";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 60);
+        doc.apply_first_line_indent(input);
+
+        // All three rows have exactly a 2-space prefix.
+        assert!(doc.rows[0].to_line().to_string().starts_with("  First"));
+        assert!(doc.rows[1].to_line().to_string().starts_with("  Second"));
+        assert!(doc.rows[2].to_line().to_string().starts_with("  Third"));
+        for i in 0..3 {
+            assert_eq!(doc.row_prefix_width(i), Some(2));
+        }
+    }
+
+    /// Blank-line-separated paragraphs each get one indent on the first
+    /// visual row; no double-indent.
+    #[test]
+    fn blank_line_separated_paragraphs_each_get_one_indent() {
+        let input = "Para one.\n\nPara two.\n\nPara three.";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent(input);
+
+        // Find the three paragraph rows (skip the blank row).
+        let texts: Vec<String> = doc
+            .rows
+            .iter()
+            .map(|r| r.to_line().to_string())
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        assert_eq!(texts.len(), 3, "should have 3 non-blank rows");
+        for text in &texts {
+            assert!(
+                text.starts_with("  Para"),
+                "paragraph should have single indent, got: {text:?}"
+            );
+            assert!(
+                !text.starts_with("    Para"),
+                "paragraph should not be double-indented, got: {text:?}"
+            );
+        }
+    }
+
+    /// `source_to_display` lands at the text-start column (prefix_width),
+    /// not inside the indent gutter.
+    #[test]
+    fn cursor_source_to_display_lands_after_indent() {
+        let input = "hello world";
+        let doc = VisualDocument::from_source(input, 40, Style::default());
+        let mut doc = doc;
+        doc.apply_first_line_indent(input);
+
+        // source pos 0 ("h") → col 2 (after the 2-cell prefix).
+        assert_eq!(doc.source_to_display(0), Some((0, 2)));
+        // source pos 1 ("e") → col 3.
+        assert_eq!(doc.source_to_display(1), Some((0, 3)));
+    }
+
+    /// With the prefix, `display_to_source` on a prefix cell maps to
+    /// `source_start` (for clicks), but `source_to_display` skips it.
+    /// Left from text-start (col 2) should NOT get stuck — it moves to
+    /// the previous source position, which remaps to col 2, but the app
+    /// layer treats `col == prefix_width` as a row boundary.
+    #[test]
+    fn indent_prefix_navigation_does_not_trap() {
+        let input = "hello world";
+        let doc = VisualDocument::from_source(input, 40, Style::default());
+        let mut doc = doc;
+        doc.apply_first_line_indent(input);
+
+        // Click in the prefix (col 0) maps to source_start.
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(0, 1), Some(0));
+        // Click at text-start (col 2) maps to the first char.
+        assert_eq!(doc.display_to_source(0, 2), Some(0));
+        // source_to_display for source 0 skips to text-start.
+        assert_eq!(doc.source_to_display(0), Some((0, 2)));
+        // prefix_width is exported for the app layer.
+        assert_eq!(doc.row_prefix_width(0), Some(2));
+    }
+
+    /// Tab-indented source line: the text-start source position maps to
+    /// col 2 (after the visual prefix), and the indent cells (cols 0-1)
+    /// map to the tab's source position for clicks.
+    #[test]
+    fn tab_indented_cursor_positions() {
+        // \tShe... → tab at pos 0, S at pos 1, h at pos 2, ...
+        let input = "\tShe";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent(input);
+
+        let text = doc.rows[0].to_line().to_string();
+        assert!(
+            text.starts_with("  She"),
+            "expected indent + text, got: {text:?}"
+        );
+
+        // Prefix cells map to source_start (the tab, pos 0).
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(0, 1), Some(0));
+        // Text-start ("S") maps to source pos 1.
+        assert_eq!(doc.display_to_source(0, 2), Some(1));
+        // source_to_display for the tab (pos 0) skips prefix → col 2 (text-start).
+        assert_eq!(doc.source_to_display(0), Some((0, 2)));
+        // source_to_display for "S" (pos 1) → col 2.
+        assert_eq!(doc.source_to_display(1), Some((0, 2)));
+    }
+
+    /// Wrapping: first row gets indent, continuation rows do not.
+    #[test]
+    fn wrapping_continuation_rows_not_indented() {
+        let input = "alpha beta gamma delta epsilon";
+        let doc = VisualDocument::from_source(input, 12, Style::default());
+        let mut doc = doc;
+        doc.apply_first_line_indent(input);
+
+        // First row has indent.
+        assert!(doc.rows[0].to_line().to_string().starts_with("  alpha"));
+        // Continuation rows have no indent.
+        let cont1 = doc.rows[1].to_line().to_string();
+        let cont2 = doc.rows[2].to_line().to_string();
+        assert!(
+            !cont1.starts_with("  "),
+            "continuation row should not be indented: {cont1:?}"
+        );
+        assert!(
+            !cont2.starts_with("  "),
+            "continuation row should not be indented: {cont2:?}"
+        );
+        // Continuation rows have prefix_width == 0.
+        assert_eq!(doc.row_prefix_width(1), Some(0));
+        assert_eq!(doc.row_prefix_width(2), Some(0));
+    }
+
+    /// Structural exclusions: headings, lists, blockquotes, fences, and
+    /// thematic breaks still do not receive synthetic indent.
+    #[test]
+    fn structural_exclusions_still_work() {
+        let input = "# Heading\n\n- list\n\n> blockquote\n\n```\ncode\n```\n\n---\n\nprose";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent(input);
+
+        let texts: Vec<String> = doc.rows.iter().map(|r| r.to_line().to_string()).collect();
+
+        // The last row is the prose paragraph and should be indented.
+        let prose = &texts[texts.len() - 1];
+        assert!(
+            prose.starts_with("  prose"),
+            "last prose row must be indented: {prose:?}"
+        );
+
+        // Heading row should NOT start with "  ".
+        let heading = texts.iter().find(|t| t.contains("Heading")).unwrap();
+        assert!(
+            !heading.starts_with("  "),
+            "heading should not be indented: {heading:?}"
+        );
+
+        // List item should NOT start with "  ".
+        let list = texts.iter().find(|t| t.contains("list")).unwrap();
+        assert!(
+            !list.starts_with("  "),
+            "list should not be indented: {list:?}"
+        );
+
+        // Code inside fence should NOT be indented.
+        let code = texts.iter().find(|t| t.contains("code")).unwrap();
+        assert!(
+            !code.starts_with("  "),
+            "code should not be indented: {code:?}"
+        );
+    }
+
+    /// Paragraph indent does not affect source-peek mode (source mode
+    /// doesn't call apply_first_line_indent).
+    #[test]
+    fn source_mode_unchanged_by_indent_logic() {
+        let input = "\tindented";
+        let doc = VisualDocument::from_source(input, 20, Style::default());
+
+        // Source mode keeps the tab expansion (3 cells) as-is.
+        let text = doc.rows[0].to_line().to_string();
+        assert!(
+            text.starts_with("   indented"),
+            "source mode shows tab expansion: {text:?}"
+        );
+        // No prefix in source mode.
+        assert_eq!(doc.row_prefix_width(0), Some(0));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Indented code block exclusion
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// A tab-prefixed line following a blank line is a CommonMark
+    /// indented code block and must NOT receive paragraph indent.
+    #[test]
+    fn indented_code_block_after_blank_skips_indent() {
+        let input = "prose\n\n\tcode line\n\tmore code\n\nmore prose";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 60);
+        doc.apply_first_line_indent(input);
+
+        let code_rows: Vec<String> = doc
+            .rows
+            .iter()
+            .map(|r| r.to_line().to_string())
+            .filter(|t| t.contains("code"))
+            .collect();
+        assert!(!code_rows.is_empty());
+        for text in &code_rows {
+            assert!(
+                !text.starts_with("  "),
+                "code should not be indented: {text:?}"
+            );
+        }
+    }
+
+    /// Four-space-indented code blocks (blank-line-separated) also skip
+    /// paragraph indent.
+    #[test]
+    fn four_space_indented_code_block_skips_indent() {
+        let input = "Text.\n\n    code line\n    more code\n\nMore text.";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 60);
+        doc.apply_first_line_indent(input);
+
+        for row in &doc.rows {
+            let text = row.to_line().to_string();
+            if text.contains("code") {
+                assert!(!text.starts_with("  "), "4-space code: {text:?}");
+            }
+        }
+    }
+
+    /// A standalone tab-prefixed line (no preceding blank) is NOT an
+    /// indented code block — it is prose and gets indent.
+    #[test]
+    fn standalone_tab_prefixed_line_is_prose() {
+        let input = "\tShe";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent(input);
+
+        assert!(doc.rows[0].to_line().to_string().starts_with("  She"));
+        assert_eq!(doc.row_prefix_width(0), Some(2));
+    }
+
+    /// Tab-prefixed lines within a prose paragraph (soft breaks, no blank
+    /// line) ARE prose continuations — the barrens-e2.md pattern: line 8
+    /// is normal prose, lines 9-12 start with tabs within the same
+    /// paragraph.
+    #[test]
+    fn barrens_pattern_tab_continuations_get_indent() {
+        let input = "Finally, she had an idea.\n\tShe looked out.\n\tShe was, of course.";
+        let rendered = render_markdown_mapped(input);
+        let mut doc = VisualDocument::from_rendered(&rendered, 60);
+        doc.apply_first_line_indent(input);
+
+        let texts: Vec<String> = doc.rows.iter().map(|r| r.to_line().to_string()).collect();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].starts_with("  Finally"));
+        assert!(
+            texts[1].starts_with("  She looked"),
+            "tab continuation: {:?}",
+            texts[1]
+        );
+        assert!(
+            texts[2].starts_with("  She was,"),
+            "tab continuation: {:?}",
+            texts[2]
         );
     }
 }

@@ -295,8 +295,90 @@ impl WritermApp {
             KeyCode::Up if !ctrl && !alt => self.move_visual_vertical(-1, shift),
             KeyCode::Down if !ctrl && !alt => self.move_visual_vertical(1, shift),
             KeyCode::Up | KeyCode::Down if ctrl || alt => {}
+            // When paragraph indent is enabled and we're not in source-peek
+            // mode, Backspace at the visible text-start of an indented row
+            // atomically deletes the hidden separator (newline + leading
+            // whitespace) so the action produces an immediate visible change
+            // instead of a no-op press.
+            KeyCode::Backspace
+                if !self.source_peek
+                    && !ctrl
+                    && !alt
+                    && self.paragraph_indent
+                    && self.handle_indented_backspace() => {}
             _ => self.handle_editor_key(key),
         }
+    }
+
+    /// When paragraph indent is on, the cursor sits at the visible
+    /// text-start of an indented row, and the hidden separator between
+    /// this row and the previous indented-prose row is a single newline
+    /// followed only by spaces/tabs, one Backspace atomically deletes that
+    /// separator so the user sees an immediate visible change (soft-break
+    /// line merge).  Returns `true` if handled; `false` means the caller
+    /// must forward the key to the normal editor path.
+    ///
+    /// Safety guards:
+    /// - Never handles when a selection exists (falls through to editor).
+    /// - The previous visual row must be indented prose (has a synthetic
+    ///   prefix).  Structural rows, blank lines, and continuation rows
+    ///   are not crossed.
+    /// - The gap between the previous row's `source_end` and the cursor
+    ///   must contain exactly one newline (`\n` or `\r\n`) followed only
+    ///   by ASCII spaces and/or tabs.  Blank-line paragraph breaks
+    ///   (`\n\n`) and non-whitespace characters are rejected.
+    fn handle_indented_backspace(&mut self) -> bool {
+        // Never interfere with selection deletion.
+        if self.editor.state.selection.is_some() {
+            return false;
+        }
+
+        self.refresh_render_cache();
+        let visual = self.visual_document();
+        let cursor = self.editor.cursor_char_pos();
+        let Some((row, col)) = visual.source_to_display(cursor) else {
+            return false;
+        };
+
+        // Must be exactly at the text-start of an indented row.
+        let prefix = visual.row_prefix_width(row).unwrap_or(0);
+        if prefix == 0 || col != prefix {
+            return false;
+        }
+
+        // Previous visual row must be indented prose (has its own
+        // synthetic prefix).  Structural rows, blank lines, and
+        // wrapping continuation rows have prefix_width == 0 and are
+        // rejected by `prev_prose_row_end`.
+        let Some(prev_end) = visual.prev_prose_row_end(row) else {
+            return false;
+        };
+
+        if cursor <= prev_end {
+            return false;
+        }
+
+        // Validate the gap: one newline followed only by spaces/tabs.
+        // prev_end and cursor are char offsets but String slicing uses
+        // byte offsets, so convert to byte offsets first to avoid
+        // panicking on multi-byte (non-ASCII) characters.
+        let text = self.editor.text();
+        let prev_end_byte = jones_text::nth_char_byte_offset(&text, prev_end);
+        let cursor_byte = jones_text::nth_char_byte_offset(&text, cursor);
+        let gap = &text[prev_end_byte..cursor_byte];
+        if !is_soft_break_separator(gap) {
+            return false;
+        }
+
+        // Atomic deletion — one editor transaction, one undo step.
+        let delete_len = cursor - prev_end;
+        self.editor.buffer.delete_range(prev_end, delete_len);
+        self.editor.move_cursor_to_char_pos(prev_end);
+        self.last_edit = Some(Instant::now());
+        self.desired_display_col = None;
+        self.refresh_document_metadata();
+        self.ensure_cursor_visible();
+        true
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -548,9 +630,10 @@ impl WritermApp {
         let Some((row, col)) = visual.source_to_display(current) else {
             return;
         };
+        let prefix = visual.row_prefix_width(row).unwrap_or(0);
         let target = match delta.cmp(&0) {
             std::cmp::Ordering::Less => {
-                if col > 0 {
+                if col > prefix {
                     visual.display_to_source(row, col - 1)
                 } else {
                     row.checked_sub(1)
@@ -612,7 +695,10 @@ impl WritermApp {
         let col = if end {
             visual.row_width(row).unwrap_or_default()
         } else {
-            0
+            // Start-of-line lands at the first text character, skipping
+            // any synthetic indent prefix so Home goes to the visible
+            // text start rather than into the indent gutter.
+            visual.row_prefix_width(row).unwrap_or(0)
         };
         let Some(char_pos) = visual.display_to_source(row, col) else {
             return;
@@ -1243,6 +1329,35 @@ fn point_in(area: Rect, col: u16, row: u16) -> bool {
         && col < area.x + area.width
         && row >= area.y
         && row < area.y + area.height
+}
+
+/// Returns `true` when `gap` is a valid soft-break separator: exactly
+/// one newline (`\n` or `\r\n`) followed by zero or more ASCII spaces
+/// and/or tabs.  Rejects empty gaps, multiple newlines (blank-line
+/// paragraph breaks), bare `\r`, and any non-whitespace characters.
+fn is_soft_break_separator(gap: &str) -> bool {
+    if gap.is_empty() {
+        return false;
+    }
+    let bytes = gap.as_bytes();
+    let mut pos = 0;
+    // Optional CR before LF.
+    if bytes.get(pos) == Some(&b'\r') {
+        pos += 1;
+    }
+    // Must have exactly one LF.
+    if bytes.get(pos) != Some(&b'\n') {
+        return false;
+    }
+    pos += 1;
+    // Everything after the newline must be ASCII spaces or tabs.
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b' ' | b'\t' => pos += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn ensure_row_visible(scroll: &mut usize, row: usize, viewport: usize) {
@@ -2894,5 +3009,415 @@ mod tests {
                 "row {idx} width {w} must not overflow at effective_wrap=1"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Paragraph-indent Backspace regression
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn app_with_indent(path: PathBuf) -> WritermApp {
+        let mut config = Config::default();
+        config.layout.paragraph_indent = true;
+        WritermApp::with_config(Some(path), config).unwrap()
+    }
+
+    /// Backspace at the visible text-start of a tab-indented prose
+    /// continuation line atomically deletes the hidden newline+tab
+    /// separator, merging the line with the previous one in a single
+    /// user-visible action.  The cursor remains at the merged position
+    /// and the document text changes immediately.
+    #[test]
+    fn backspace_at_tab_indented_text_start_merges_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Model: normal line followed by tab-prefixed continuation in the
+        // same Markdown paragraph (soft break — barrens-e2.md pattern).
+        std::fs::write(&path, "First line.\n\tSecond line.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Verify initial visual state: two rows, both indented.
+        let visual = app.visual_document();
+        assert_eq!(visual.rows.len(), 2);
+        assert!(visual.rows[0].to_line().to_string().starts_with("  First"));
+        assert!(visual.rows[1].to_line().to_string().starts_with("  Second"));
+        assert_eq!(visual.row_prefix_width(0), Some(2));
+        assert_eq!(visual.row_prefix_width(1), Some(2));
+
+        // Move cursor to the text-start of the second row.
+        // "Second" starts at source position 13: 0-10="First line.",
+        // 11='\n', 12='\t', 13='S'.
+        // source_to_display(13) should return (1, 2) — text-start.
+        let display = visual.source_to_display(13).unwrap();
+        assert_eq!(
+            display,
+            (1, 2),
+            "cursor should land at text-start after indent"
+        );
+        app.editor.move_cursor_to_char_pos(13);
+
+        // One Backspace.
+        let text_before = app.editor.text();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // Source text must have changed: the newline and tab are gone,
+        // lines are merged.
+        assert_ne!(text_before, text_after, "Backspace must change source text");
+        assert!(
+            !text_after.contains('\t'),
+            "tab should be deleted, got: {text_after:?}"
+        );
+        assert_eq!(
+            text_after.lines().count(),
+            1,
+            "lines should be merged into one: {text_after:?}"
+        );
+        assert!(
+            text_after.starts_with("First line.Second line."),
+            "merged text should be 'First line.Second line.', got: {text_after:?}"
+        );
+
+        // Visual state must have changed — only one visual row now.
+        let visual_after = app.visual_document();
+        let non_blank: Vec<_> = visual_after
+            .rows
+            .iter()
+            .filter(|r| !r.to_line().to_string().trim().is_empty())
+            .collect();
+        assert_eq!(non_blank.len(), 1, "should have one merged visual row");
+
+        // Cursor must be at a valid position, not trapped.
+        let cursor = app.editor.cursor_char_pos();
+        let display_after = visual_after.source_to_display(cursor);
+        assert!(
+            display_after.is_some(),
+            "cursor must have a valid display position"
+        );
+        // The cursor should be on the merged line, at or after the "Second" text start.
+        let (row, col) = display_after.unwrap();
+        assert_eq!(row, 0, "cursor should be on the single merged visual row");
+        assert!(col >= 2, "cursor should be past the indent prefix");
+    }
+
+    /// Same as above but with space-prefixed continuation (4 spaces
+    /// instead of a tab).  Backspace atomically consumes the hidden
+    /// whitespace boundary so the user sees one clear action.
+    #[test]
+    fn backspace_at_space_indented_text_start_merges_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "First para.\n    Second line.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Source positions: "First para." = 11 chars (0-10), '\n' = 11,
+        // "    " = 12-15, 'S' = 16.
+        // After rendering, leading spaces trimmed, indent added.
+        let visual = app.visual_document();
+        assert!(visual.rows[1].to_line().to_string().starts_with("  Second"));
+
+        // Text-start of "Second" is at source position 16.
+        let display = visual.source_to_display(16).unwrap();
+        assert_eq!(display.0, 1, "should be on second visual row");
+        app.editor.move_cursor_to_char_pos(16);
+
+        let text_before = app.editor.text();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // Source text must have changed — no silent no-op.
+        assert_ne!(text_before, text_after, "Backspace must change source text");
+
+        // Visual state: lines merged into one visual row.
+        let visual_after = app.visual_document();
+        let non_blank: Vec<_> = visual_after
+            .rows
+            .iter()
+            .filter(|r| !r.to_line().to_string().trim().is_empty())
+            .collect();
+        assert_eq!(non_blank.len(), 1, "should merge visual rows");
+
+        // Cursor must have a valid display position, not trapped.
+        let cursor = app.editor.cursor_char_pos();
+        let display_after = visual_after.source_to_display(cursor);
+        assert!(
+            display_after.is_some(),
+            "cursor must have valid display position"
+        );
+    }
+
+    /// Backspace at the text-start of the FIRST paragraph (no previous
+    /// visual row) falls through to normal editor behavior — the cursor
+    /// is at position 0, Backspace does nothing.
+    #[test]
+    fn backspace_at_first_paragraph_text_start_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Hello world").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Cursor at text-start (source pos 0, col 2 after indent).
+        app.editor.move_cursor_to_char_pos(0);
+        let text_before = app.editor.text();
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        // Text should be unchanged (no previous row to merge with).
+        assert_eq!(app.editor.text(), text_before);
+    }
+
+    /// Normal Backspace behavior is preserved when NOT at text-start:
+    /// Backspace deletes the character before the cursor as usual.
+    #[test]
+    fn backspace_mid_text_uses_normal_editor_behavior() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Hello world").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Cursor at source pos 3 ("l" in "Hello").
+        app.editor.move_cursor_to_char_pos(3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        // Normal backspace: delete the character before the cursor.
+        assert_eq!(app.editor.text(), "Helo world");
+    }
+
+    /// Backspace at the text-start of an indented prose row does NOT
+    /// merge across a structural boundary (heading).  The hidden-
+    /// separator handler rejects the previous row because headings have
+    /// `prefix_width == 0`, so Backspace falls through to normal editor
+    /// behavior (deleting the `\n` before the heading).
+    #[test]
+    fn backspace_does_not_merge_across_heading() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Prose paragraph followed by a heading, then blank-line, then prose.
+        std::fs::write(&path, "prose line.\n# Heading\n\nAfter heading.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Find the visual row for "After heading." — it should be indented.
+        let visual = app.visual_document();
+        let after_row = visual
+            .rows
+            .iter()
+            .position(|r| r.to_line().to_string().contains("After heading"))
+            .expect("should have After heading row");
+        assert_eq!(
+            visual.row_prefix_width(after_row),
+            Some(2),
+            "prose after heading should be indented"
+        );
+
+        // Move cursor to text-start of "After heading."
+        // Source: "prose line.\n# Heading\n\nAfter heading."
+        // Positions: 0-10="prose line.", 11='\n', 12-20="# Heading", 21='\n',
+        //   22='\n', 23-36="After heading."
+        // Text-start of "After heading": source pos 23.
+        let display = visual.source_to_display(23).unwrap();
+        assert_eq!(display.0, after_row);
+        app.editor.move_cursor_to_char_pos(23);
+
+        let text_before = app.editor.text();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // The # Heading row is structural (no prefix), so the atomic
+        // deletion must NOT fire.  Normal Backspace deletes one char
+        // (the '\n' at pos 22), merging the blank line with the prose.
+        // The heading stays on its own line.
+        assert!(
+            text_after.contains("# Heading"),
+            "heading must survive Backspace: {text_after:?}"
+        );
+        // The blank line between heading and prose should be gone
+        // (one \n was deleted), but the heading line-break should remain.
+        assert_ne!(text_before, text_after, "text should have changed");
+        let lines: Vec<&str> = text_after.lines().collect();
+        // After deleting one \n: "prose line.", "# Heading", "After heading."
+        // Wait — the blank line becomes empty, so we have:
+        // "prose line.\n# Heading\n\nAfter heading." → delete \n at 22 →
+        // "prose line.\n# Heading\nAfter heading." (3 lines)
+        assert_eq!(lines.len(), 3, "should have 3 lines, got: {lines:?}");
+    }
+
+    /// Backspace at text-start of a blank-line-separated paragraph does
+    /// NOT atomically delete the blank-line separator.  The blank row
+    /// has `prefix_width == 0`, so the handler falls through to normal
+    /// Backspace (one character deletion).
+    #[test]
+    fn backspace_does_not_cross_blank_line_separator() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "First para.\n\nSecond para.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        let visual = app.visual_document();
+        // "Second para." starts at source position 13 (after "First para.\n\n").
+        // source_to_display(13) should return text-start (col 2 after indent).
+        let _display = visual.source_to_display(13).unwrap();
+        assert_eq!(_display.1, 2, "cursor should be at text-start");
+        app.editor.move_cursor_to_char_pos(13);
+
+        let text_before = app.editor.text();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // One Backspace deletes one character (the '\n' at pos 12).
+        // The paragraphs should NOT merge — there's still a \n remaining.
+        assert_ne!(text_before, text_after);
+        assert!(
+            text_after.contains("First para."),
+            "first para must survive"
+        );
+        assert!(
+            text_after.contains("Second para."),
+            "second para must survive"
+        );
+        // After deleting one \n: "First para.\nSecond para." (2 lines)
+        let lines: Vec<&str> = text_after.lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 lines, got: {lines:?}");
+    }
+
+    /// When a selection exists at the text-start of an indented row,
+    /// the handler falls through to normal editor Backspace (which
+    /// deletes the selection).
+    #[test]
+    fn backspace_with_selection_falls_through_to_editor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "First line.\n\tSecond line.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        // Source: 0-10="First line.", 11='\n', 12='\t', 13-24="Second line."
+        // Create a selection covering "Second" (positions 13-18 inclusive, 6 chars).
+        app.editor.move_cursor_to_char_pos(13);
+        app.editor.state.start_selection();
+        app.editor.move_cursor_to_char_pos(19);
+        app.editor.state.extend_selection();
+        // Selection covers [13, 19).
+
+        let text_before = app.editor.text();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // Selection was deleted. "Second" (6 chars) removed.
+        assert_ne!(
+            text_before, text_after,
+            "text should change when selection deleted"
+        );
+        assert!(
+            !text_after.contains("Second"),
+            "selection should be deleted: {text_after:?}"
+        );
+        // The surrounding structure should survive.
+        assert!(
+            text_after.contains("First line."),
+            "first line must survive"
+        );
+        assert!(
+            text_after.contains('\t'),
+            "tab should survive: {text_after:?}"
+        );
+        assert!(
+            text_after.contains(" line."),
+            "rest of line should survive: {text_after:?}"
+        );
+    }
+
+    /// Regression test: non-ASCII characters before a `\n\t` continuation
+    /// cause char-offset vs byte-offset mismatch when slicing the gap
+    /// string.  The fix uses `nth_char_byte_offset` to convert to byte
+    /// offsets before slicing.  Without the fix, this test panics.
+    ///
+    /// "Hëllõ." = 6 chars but 8 bytes (ë=2 bytes, õ=2 bytes).  Char 6
+    /// is '\n' at byte 8, char 7 is '\t' at byte 9, char 8 is 'S' at
+    /// byte 10.  The gap between prev_end (char 6) and cursor (char 8)
+    /// in char space is "\n\t", but a naive `text[6..8]` byte-slice
+    /// lands inside 'õ' (bytes 5-6) and panics.
+    #[test]
+    fn backspace_with_non_ascii_before_continuation_does_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Hëllõ.\n\tSecond").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        let visual = app.visual_document();
+        // "Hëllõ." (chars 0-5), '\n' (6), '\t' (7), "Second" (8-13).
+        // S of "Second" is at char offset 8.
+        let display = visual.source_to_display(8).unwrap();
+        assert_eq!(
+            display.1, 2,
+            "cursor should be at col 2 (text-start) on second row"
+        );
+        app.editor.move_cursor_to_char_pos(8);
+
+        let text_before = app.editor.text();
+        // This call must NOT panic (regression).
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let text_after = app.editor.text();
+
+        // Lines merged (the \n\t separator was consumed atomically).
+        assert_ne!(text_before, text_after, "Backspace must change source text");
+        assert_eq!(
+            text_after.lines().count(),
+            1,
+            "lines should be merged into one: {text_after:?}"
+        );
+        // Non-ASCII content at the start must be preserved.
+        assert!(
+            text_after.starts_with("Hëllõ."),
+            "non-ASCII text must survive: {text_after:?}"
+        );
+        assert!(
+            text_after.contains("Second"),
+            "second-line text must be merged: {text_after:?}"
+        );
+    }
+
+    /// After the atomic backspace deletion, document metadata (word
+    /// count etc.) is refreshed, and the buffer version changes.
+    #[test]
+    fn backspace_at_indented_start_refreshes_metadata() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "First line.\n\tSecond line.").unwrap();
+        let mut app = app_with_indent(path);
+        app.document_area = Rect::new(0, 0, 60, 10);
+
+        let version_before = app.editor.buffer.version();
+        let wc_before = app.word_count();
+
+        // Cursor at text-start of second row.
+        let visual = app.visual_document();
+        let _display = visual.source_to_display(13).unwrap();
+        app.editor.move_cursor_to_char_pos(13);
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        // Buffer version must have incremented.
+        assert_ne!(
+            app.editor.buffer.version(),
+            version_before,
+            "buffer version must change after edit"
+        );
+        // Word count must be updated (cache was rebuilt).
+        let wc_after = app.word_count();
+        // "First line." + "Second line." = "First line.Second line."
+        // = "First" "line" "Second" "line" = 4 words.  Original had same.
+        // Actually, word count depends on whitespace splitting.
+        // Before: "First line.\n\tSecond line." — words: "First", "line.", "Second", "line."
+        // After:  "First line.Second line." — words: "First", "line.Second", "line."
+        // So it should change.
+        assert_eq!(wc_before, 4);
+        assert_eq!(wc_after, 3); // "line.Second" is one word now
     }
 }
