@@ -187,6 +187,44 @@ impl VisualDocument {
         }
         closest
     }
+
+    /// Apply a 2-space visual indent to the first visual row of each
+    /// ordinary prose paragraph. Structural rows (headings, lists,
+    /// blockquotes, fenced code, thematic rules, blank lines) and already-
+    /// indented rows are left alone. The indent inserts visual-only cells
+    /// that map back to the row's `source_start` so cursor navigation and
+    /// click-to-position continue to work without violating source-byte
+    /// mappings.
+    ///
+    /// Line boundaries are precomputed once as byte ranges so the per-row
+    /// cost is O(log lines) — typically ~12 comparisons for a 4000-line
+    /// document.
+    pub fn apply_first_line_indent(&mut self, source_text: &str) {
+        let info = build_indent_line_info(source_text);
+        if info.byte_bounds.is_empty() {
+            return;
+        }
+        let mut last_source_line: Option<usize> = None;
+        for row in &mut self.rows {
+            if !row.mapped || row.source_start == row.source_end {
+                last_source_line = None;
+                continue;
+            }
+            let source_line = line_for_char_pos(&info, row.source_start);
+            if Some(source_line) == last_source_line {
+                continue;
+            }
+            last_source_line = Some(source_line);
+            // Never indent content inside fenced code blocks.
+            if info.in_fence.get(source_line).copied().unwrap_or(false) {
+                continue;
+            }
+            let line_text = slice_line(source_text, &info, source_line);
+            if is_prose_paragraph(line_text) {
+                row.prepend_indent(2);
+            }
+        }
+    }
 }
 
 impl VisualRow {
@@ -394,6 +432,26 @@ impl VisualRow {
             }
         }
         best_col
+    }
+
+    /// Prepend `width` blank cells to the front of this row. Every new
+    /// cell maps back to `source_start` so the cursor can address the
+    /// indent region and land at the start of the prose line. The prefix
+    /// span carries no style (Style::default) so it inherits whatever the
+    /// drawing layer provides — typically the same background as the
+    /// surrounding document surface.
+    fn prepend_indent(&mut self, width: usize) {
+        let prefix = " ".repeat(width);
+        self.spans.insert(
+            0,
+            VisualSpan {
+                content: prefix,
+                style: Style::default(),
+            },
+        );
+        for i in 0..width {
+            self.col_sources.insert(i, self.source_start);
+        }
     }
 }
 
@@ -625,6 +683,229 @@ fn trim_trailing_spaces(cells: &mut Vec<Cell>) {
     }
 }
 
+// ── Paragraph indent helpers ──────────────────────────────────────────
+
+/// Precomputed line boundaries used by `apply_first_line_indent`.
+/// Built once per indent pass; per-row lookups are O(log lines).
+struct IndentLineInfo {
+    /// `(byte_start, byte_end)` for each physical line (excluding the
+    /// trailing newline).
+    byte_bounds: Vec<(usize, usize)>,
+    /// Character offset of the start of each line, monotonically
+    /// increasing.  Used for binary search to map a char position to
+    /// a line index without a per-row char→byte scan.
+    char_starts: Vec<usize>,
+    /// `true` when this physical line is inside a fenced code block
+    /// (between an opening `` ``` `` / ``~~~`` and its matching closing
+    /// fence).  Content lines inside a fence never receive a prose indent.
+    in_fence: Vec<bool>,
+}
+
+fn build_indent_line_info(source_text: &str) -> IndentLineInfo {
+    let mut byte_bounds = Vec::new();
+    let mut char_starts = Vec::new();
+    let mut char_cursor = 0usize;
+    let mut byte_cursor = 0usize;
+    let bytes = source_text.as_bytes();
+    while byte_cursor < bytes.len() {
+        let line_start = byte_cursor;
+        char_starts.push(char_cursor);
+        let line_end = bytes[byte_cursor..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|off| byte_cursor + off)
+            .unwrap_or(bytes.len());
+        // Normalise CRLF: if the byte before the newline is '\r',
+        // exclude it from the content range.
+        let content_end = if line_end > line_start && bytes[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let advance = if line_end < bytes.len() {
+            line_end + 1 // skip '\n'
+        } else {
+            line_end
+        };
+        byte_bounds.push((line_start, content_end));
+        let segment = &source_text[byte_cursor..advance];
+        char_cursor += segment.chars().count();
+        byte_cursor = advance;
+    }
+    if source_text.ends_with('\n') && !source_text.is_empty() {
+        char_starts.push(char_cursor);
+        byte_bounds.push((source_text.len(), source_text.len()));
+    }
+
+    // Second pass: mark lines that live inside fenced code blocks.
+    let in_fence = mark_fence_lines(source_text, &byte_bounds);
+
+    IndentLineInfo {
+        byte_bounds,
+        char_starts,
+        in_fence,
+    }
+}
+
+/// Returns a `Vec<bool>` parallel to `byte_bounds` indicating which
+/// physical lines reside inside a fenced code block.  Opening and closing
+/// fence lines themselves are NOT marked (they are structural by nature),
+/// but everything between them is.
+///
+/// A fence marker is a line whose trimmed content begins with at least
+/// three backticks or three tildes.  Leading whitespace is permitted.
+fn mark_fence_lines(source_text: &str, byte_bounds: &[(usize, usize)]) -> Vec<bool> {
+    let mut result = vec![false; byte_bounds.len()];
+    let mut fence_char: Option<char> = None;
+    for (idx, &(start, end)) in byte_bounds.iter().enumerate() {
+        let line = source_text.get(start..end).unwrap_or("");
+        let trimmed = line.trim();
+        if let Some(fc) = fence_char {
+            // Inside a fence — is this the closing marker?
+            if is_fence_marker(trimmed, fc) {
+                fence_char = None;
+            }
+            // The opening marker line itself is at idx 0 inside this
+            // block; content lines after the opener get marked.
+            // We mark *every* line after the opener until the closer
+            // is seen.  The opener line itself is NOT marked.
+        } else {
+            // Not inside a fence — check for an opening marker.
+            if let Some(fc) = fence_char_from_line(trimmed) {
+                fence_char = Some(fc);
+            }
+        }
+        // Only mark content lines, not the opening fence line.
+        if fence_char.is_some() {
+            result[idx] = true;
+        }
+    }
+    // Walk back: the opening fence line itself should not be marked.
+    // We need to find each opening fence and clear its in_fence flag.
+    let mut i = 0;
+    while i < result.len() {
+        if result[i] {
+            // This is either the opening fence line (first line of this
+            // block) or a content line.  The opening line was mistakenly
+            // marked above.  Find the actual opening line and unmark it.
+            let (start, end) = byte_bounds[i];
+            let line = source_text.get(start..end).unwrap_or("");
+            let trimmed = line.trim();
+            if fence_char_from_line(trimmed).is_some() {
+                // This is an opening fence line — unmark it.
+                result[i] = false;
+                // Skip past closing fence.
+                let fence_char = fence_char_from_line(trimmed).unwrap();
+                for j in (i + 1)..result.len() {
+                    let (s, e) = byte_bounds[j];
+                    let l = source_text.get(s..e).unwrap_or("");
+                    if is_fence_marker(l.trim(), fence_char) {
+                        result[j] = false;
+                        i = j;
+                        break;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Returns `Some(c)` if `trimmed_line` is a fenced-code-block marker
+/// (at least three backticks or tildes), where `c` is the fence character.
+fn fence_char_from_line(trimmed: &str) -> Option<char> {
+    let first = trimmed.chars().next()?;
+    if (first != '`' && first != '~') || trimmed.len() < 3 {
+        return None;
+    }
+    // The line must start with at least 3 of the same character,
+    // possibly followed by an info string.
+    let count = trimmed.chars().take_while(|&c| c == first).count();
+    if count >= 3 { Some(first) } else { None }
+}
+
+/// Returns `true` when `trimmed_line` is a closing fence matching `fence_char`.
+fn is_fence_marker(trimmed: &str, fence_char: char) -> bool {
+    fence_char_from_line(trimmed) == Some(fence_char)
+}
+
+/// Binary search `info.char_starts` for the line whose content contains
+/// `char_pos`.  Returns a valid line index.
+fn line_for_char_pos(info: &IndentLineInfo, char_pos: usize) -> usize {
+    // Find the last line whose char_start <= char_pos.
+    let idx = info.char_starts.partition_point(|&cs| cs <= char_pos);
+    idx.saturating_sub(1)
+}
+
+/// Return the source text for line index `line_idx`, using precomputed
+/// byte bounds.
+fn slice_line<'a>(source_text: &'a str, info: &IndentLineInfo, line_idx: usize) -> &'a str {
+    let Some(&(start, end)) = info.byte_bounds.get(line_idx) else {
+        return "";
+    };
+    source_text.get(start..end).unwrap_or("")
+}
+
+/// Returns `true` when `line` looks like an ordinary prose paragraph
+/// that should receive a first-line visual indent. Structural lines
+/// (headings, lists, blockquotes, fenced code, thematic rules, table
+/// rows, blank lines) and already-indented lines are excluded.
+fn is_prose_paragraph(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Leading whitespace suggests the user already indented.
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+    // Table rows (pipe-delimited).
+    if trimmed.starts_with('|') {
+        return false;
+    }
+    // ATX headings.
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    // Unordered list bullet: '-', '*', '+'.
+    if let Some(rest) = trimmed
+        .strip_prefix('-')
+        .or_else(|| trimmed.strip_prefix('*'))
+        .or_else(|| trimmed.strip_prefix('+'))
+        && (rest.is_empty() || rest.starts_with(' '))
+    {
+        return false;
+    }
+    // Ordered list: "1." / "99." / "1)" / "99)" style.
+    if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
+        let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_digits.starts_with(". ")
+            || after_digits.starts_with(".)")
+            || after_digits.starts_with(") ")
+        {
+            return false;
+        }
+    }
+    // Blockquote.
+    if trimmed.starts_with('>') {
+        return false;
+    }
+    // Fenced code block markers.
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        return false;
+    }
+    // Thematic break: three or more of the same punctuation.
+    if let Some(ch) = trimmed.chars().next()
+        && matches!(ch, '-' | '*' | '_' | '=')
+        && trimmed.chars().all(|c| c == ch || c == ' ')
+        && trimmed.chars().filter(|&c| c == ch).count() >= 3
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1117,303 @@ mod tests {
         assert_eq!(doc.display_to_source(0, 3), Some(1));
         assert_eq!(doc.display_to_source(0, 5), Some(1));
         assert_eq!(doc.display_to_source(0, 6), Some(2));
+    }
+
+    // ── Paragraph indent tests ────────────────────────────────────────
+
+    #[test]
+    fn indent_adds_two_cells_to_prose_paragraph_first_row() {
+        let doc = VisualDocument::from_source("alpha beta gamma", 40, Style::default());
+        let mut doc = doc; // make mutable
+        doc.apply_first_line_indent("alpha beta gamma");
+
+        // The single prose paragraph gets 2 cells of indent prepended.
+        assert_eq!(doc.rows[0].to_line().to_string(), "  alpha beta gamma");
+        assert_eq!(doc.row_width(0), Some(2 + "alpha beta gamma".len()));
+    }
+
+    #[test]
+    fn indent_preserves_source_mapping_on_indented_row() {
+        let doc = VisualDocument::from_source("hello world", 40, Style::default());
+        let mut doc = doc;
+        doc.apply_first_line_indent("hello world");
+
+        // The two indent cells map to source_start (0).
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        assert_eq!(doc.display_to_source(0, 1), Some(0));
+        // The third display cell is the start of the actual text.
+        assert_eq!(doc.display_to_source(0, 2), Some(0)); // first char "h"
+        // source_to_display at position 0 should return col 0 (on indent).
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        // source_to_display at position 5 (" " after hello) should return
+        // the cell just after "hello", shifted by 2 for the indent.
+        assert_eq!(doc.source_to_display(5), Some((0, 7)));
+    }
+
+    #[test]
+    fn indent_skips_headings() {
+        let rendered = render_markdown_mapped("# Heading");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("# Heading");
+
+        // Heading row should NOT get an indent.
+        assert!(!doc.rows[0].to_line().to_string().starts_with("  Heading"));
+    }
+
+    #[test]
+    fn indent_skips_list_items() {
+        let rendered = render_markdown_mapped("- first item\n- second item");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("- first item\n- second item");
+
+        // List items should NOT get indented.
+        for row in &doc.rows {
+            let text = row.to_line().to_string();
+            if !text.trim().is_empty() {
+                // Should start with the bullet (• or space), NOT "  ".
+                assert!(
+                    !text.starts_with("  •") && !text.starts_with("   "),
+                    "list item should not be indented, got: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indent_skips_blockquote() {
+        let rendered = render_markdown_mapped("> quoted text");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("> quoted text");
+
+        // Blockquote rows should NOT get a first-line indent (their
+        // visual "│" prefix is their own structural indent).
+        let first = doc.rows[0].to_line().to_string();
+        assert!(
+            !first.starts_with("  │"),
+            "blockquote should not get indent, got: {first:?}"
+        );
+    }
+
+    #[test]
+    fn indent_skips_thematic_break() {
+        let rendered = render_markdown_mapped("before\n\n---\n\nafter");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("before\n\n---\n\nafter");
+
+        // The thematic break row (───) should not be indented.
+        let hr_row = doc
+            .rows
+            .iter()
+            .find(|r| r.to_line().to_string().contains('─'))
+            .expect("should have a thematic break row");
+        let text = hr_row.to_line().to_string();
+        assert!(
+            !text.starts_with("  ─"),
+            "thematic break should not be indented, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn indent_skips_blank_lines() {
+        let rendered = render_markdown_mapped("text\n\nmore");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("text\n\nmore");
+
+        // Blank rows should have zero width (no indent).
+        let blank_row = &doc.rows[1];
+        assert_eq!(blank_row.to_line().to_string(), "");
+    }
+
+    #[test]
+    fn indent_skips_continuation_wrapped_rows() {
+        let doc =
+            VisualDocument::from_source("alpha beta gamma delta epsilon", 12, Style::default());
+        let mut doc = doc;
+        doc.apply_first_line_indent("alpha beta gamma delta epsilon");
+
+        // First row gets indent, continuation rows do not.
+        assert!(
+            doc.rows[0]
+                .to_line()
+                .to_string()
+                .starts_with("  alpha beta")
+        );
+        assert!(!doc.rows[1].to_line().to_string().starts_with("  gamma"));
+        assert!(!doc.rows[2].to_line().to_string().starts_with("  delta"));
+    }
+
+    #[test]
+    fn indent_preserves_navigation_across_indented_and_unindented_rows() {
+        let rendered = render_markdown_mapped("Paragraph one.\n\n# Heading\n\nParagraph two.");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("Paragraph one.\n\n# Heading\n\nParagraph two.");
+
+        // "Paragraph one." — source pos 0 maps to col 0 (on the indent
+        // cells, which map back to source_start=0).
+        assert_eq!(doc.source_to_display(0), Some((0, 0)));
+        // Cursor at the actual 'P' character (source position 0) also
+        // maps to col 0 because the indent maps to the same source pos.
+        assert_eq!(doc.display_to_source(0, 0), Some(0));
+        // The text area starts at col 2; clicking there still maps to
+        // source pos 0.
+        assert_eq!(doc.display_to_source(0, 2), Some(0));
+
+        // "Heading" heading — no indent, source_to_display still works.
+        let heading_source_start = "Paragraph one.\n\n# ".chars().count();
+        let disp = doc.source_to_display(heading_source_start);
+        assert!(disp.is_some(), "should find heading text");
+
+        // "Paragraph two." — source_to_display finds it after the heading.
+        let para2_start = "Paragraph one.\n\n# Heading\n\n".chars().count();
+        let disp2 = doc.source_to_display(para2_start);
+        assert!(disp2.is_some(), "should find second paragraph");
+    }
+
+    // ── is_prose_paragraph unit tests ─────────────────────────────────
+
+    #[test]
+    fn is_prose_paragraph_recognises_plain_text() {
+        assert!(is_prose_paragraph("Hello world"));
+        assert!(is_prose_paragraph("This is a sentence."));
+        assert!(is_prose_paragraph("singleword"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_headings() {
+        assert!(!is_prose_paragraph("# Heading"));
+        assert!(!is_prose_paragraph("## Subheading"));
+        assert!(!is_prose_paragraph("### Deep"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_list_markers() {
+        assert!(!is_prose_paragraph("- bullet"));
+        assert!(!is_prose_paragraph("* star"));
+        assert!(!is_prose_paragraph("+ plus"));
+        assert!(!is_prose_paragraph("1. ordered"));
+        assert!(!is_prose_paragraph("99. many"));
+        assert!(!is_prose_paragraph("1) paren"));
+        assert!(!is_prose_paragraph("42) paren-style"));
+        assert!(!is_prose_paragraph("7.) dot-paren"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_blockquote() {
+        assert!(!is_prose_paragraph("> quoted"));
+        assert!(!is_prose_paragraph(">"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_fenced_code() {
+        assert!(!is_prose_paragraph("```"));
+        assert!(!is_prose_paragraph("```rust"));
+        assert!(!is_prose_paragraph("~~~"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_thematic_breaks() {
+        assert!(!is_prose_paragraph("---"));
+        assert!(!is_prose_paragraph("***"));
+        assert!(!is_prose_paragraph("___"));
+        assert!(!is_prose_paragraph("==="));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_blank_and_whitespace() {
+        assert!(!is_prose_paragraph(""));
+        assert!(!is_prose_paragraph("   "));
+        assert!(!is_prose_paragraph("\t"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_already_indented() {
+        assert!(!is_prose_paragraph("    indented"));
+        assert!(!is_prose_paragraph("\tindented"));
+    }
+
+    #[test]
+    fn is_prose_paragraph_rejects_table_rows() {
+        assert!(!is_prose_paragraph("| Name | Age |"));
+        assert!(!is_prose_paragraph("| Alice | 30 |"));
+        assert!(!is_prose_paragraph("|---|---|"));
+        assert!(!is_prose_paragraph("| single cell"));
+    }
+
+    // ── Fenced-code-block indent exclusion ────────────────────────────
+
+    #[test]
+    fn indent_skips_content_inside_backtick_fence() {
+        let rendered = render_markdown_mapped(
+            "Before.\n\n```\nfn main() {\n    println!(\"hi\");\n}\n```\n\nAfter.",
+        );
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent(
+            "Before.\n\n```\nfn main() {\n    println!(\"hi\");\n}\n```\n\nAfter.",
+        );
+
+        // "Before." gets an indent.
+        assert!(doc.rows[0].to_line().to_string().starts_with("  Before"));
+
+        // Find a row containing "fn main" — it must NOT be indented.
+        let code_row = doc
+            .rows
+            .iter()
+            .find(|r| r.to_line().to_string().contains("fn main"))
+            .expect("should contain fn main");
+        let text = code_row.to_line().to_string();
+        assert!(
+            !text.starts_with("  fn"),
+            "code inside fence should not be indented, got: {text:?}"
+        );
+
+        // "After." (post-fence prose) gets an indent.
+        let after_row = doc
+            .rows
+            .iter()
+            .find(|r| r.to_line().to_string().contains("After"))
+            .expect("should contain After");
+        assert!(
+            after_row.to_line().to_string().starts_with("  After"),
+            "prose after fence should be indented"
+        );
+    }
+
+    #[test]
+    fn indent_skips_content_inside_tilde_fence() {
+        let rendered = render_markdown_mapped("Intro.\n\n~~~\ncode\nmore code\n~~~\n\nOutro.");
+        let mut doc = VisualDocument::from_rendered(&rendered, 40);
+        doc.apply_first_line_indent("Intro.\n\n~~~\ncode\nmore code\n~~~\n\nOutro.");
+
+        // "Intro." gets indent.
+        assert!(doc.rows[0].to_line().to_string().starts_with("  Intro"));
+
+        // Find a row containing "code" (inside the fence) — NOT indented.
+        let code_rows: Vec<_> = doc
+            .rows
+            .iter()
+            .filter(|r| {
+                let t = r.to_line().to_string();
+                t.contains("code") && !t.contains("Outro") && !t.contains("Intro")
+            })
+            .collect();
+        assert!(!code_rows.is_empty(), "should have code rows inside fence");
+        for row in &code_rows {
+            let text = row.to_line().to_string();
+            assert!(
+                !text.starts_with("  code") && !text.starts_with("  more"),
+                "tilde-fence code should not be indented, got: {text:?}"
+            );
+        }
+
+        // "Outro." (post-fence prose) gets indent.
+        let outro_row = doc
+            .rows
+            .iter()
+            .find(|r| r.to_line().to_string().contains("Outro"))
+            .expect("should contain Outro");
+        assert!(
+            outro_row.to_line().to_string().starts_with("  Outro"),
+            "prose after tilde fence should be indented"
+        );
     }
 }

@@ -113,7 +113,7 @@ fn draw_body(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     draw_document(frame, app, chunks[2]);
 
     if right_sep > 0 {
-        draw_vertical_separator(frame, chunks[3]);
+        draw_vertical_separator(frame, app, chunks[3]);
     }
 
     if show_files {
@@ -124,7 +124,8 @@ fn draw_body(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     }
 }
 
-fn draw_top_ribbon(frame: &mut Frame, app: &WritermApp, area: Rect) {
+fn draw_top_ribbon(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
+    let (cursor_word, total_words) = app.cursor_word_progress();
     let name = app
         .current_file_path
         .file_name()
@@ -151,8 +152,7 @@ fn draw_top_ribbon(frame: &mut Frame, app: &WritermApp, area: Rect) {
         theme::accent_cyan()
     };
     let text = format!(
-        " {name} | {dirty} | {} words | {} | {}{}",
-        app.word_count(),
+        " {name} | {dirty} | {cursor_word} / {total_words} words | {} | {}{}",
         truncate(&heading, 28),
         truncate(
             &app.current_file_path.display().to_string(),
@@ -206,8 +206,9 @@ fn draw_bottom_bar(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
     let render = if app.source_peek { "off" } else { "on" };
     let headings = if app.show_headings { "on" } else { "off" };
     let files = if app.show_files { "on" } else { "off" };
+    let indent = if app.paragraph_indent { "on" } else { "off" };
     let text = format!(
-        " WRITERM | Ctrl-S:save  Ctrl-B/I/K:fmt  Ctrl-N:new  Ctrl-Q:quit | [Ctrl-M:render {render}] [F3:hd {headings}] [F2:files {files}] "
+        " WRITERM | ^S:save  ^B/I/K:fmt  ^N:new  ^Q:quit | [^M:render {render}] [F4:indent {indent}] [F3:hd {headings}] [F2:files {files}] "
     );
     set_control_areas(app, area, &text, headings, files);
     frame.render_widget(
@@ -440,17 +441,44 @@ fn draw_metrics_content(frame: &mut Frame, app: &WritermApp, area: Rect) {
     );
 }
 
-fn draw_vertical_separator(frame: &mut Frame, area: Rect) {
+fn draw_vertical_separator(frame: &mut Frame, app: &WritermApp, area: Rect) {
     // The vertical line between a sidebar and the document is drawn on the
     // terminal background (no fill) so the document area stays visually
     // "open". The line is a thin unfocused-border color so it reads as a
     // structural separator without competing with the document text.
-    let style = separator_style();
-    let line = "│".repeat(area.height as usize);
-    frame.render_widget(
-        Paragraph::new(line).style(style),
-        Rect::new(area.x, area.y, 1, area.height),
-    );
+    // A rudimentary scrollbar thumb is rendered as a proportional block
+    // of the track when there are more visual rows than fit in the viewport.
+    let track_style = separator_style();
+    let thumb_style = Style::default().fg(theme::accent_cyan());
+    let height = area.height as usize;
+    let total = app.visual_rows_len();
+    let viewport = height;
+    let scroll = app.document_scroll;
+
+    if total == 0 || viewport >= total {
+        let line = Line::from(Span::styled("│".repeat(height), track_style));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let thumb_size = ((viewport as u64 * viewport as u64) / total as u64)
+        .max(1)
+        .min(viewport as u64) as usize;
+    let thumb_start = ((scroll as u64 * viewport as u64) / total as u64)
+        .min((viewport - thumb_size) as u64) as usize;
+
+    // Build three spans for a single-paint vertical line: track above
+    // the thumb, the thumb itself, and track below.
+    let mut spans: Vec<Span> = Vec::with_capacity(3);
+    if thumb_start > 0 {
+        spans.push(Span::styled("│".repeat(thumb_start), track_style));
+    }
+    spans.push(Span::styled("█".repeat(thumb_size), thumb_style));
+    let after = height.saturating_sub(thumb_start + thumb_size);
+    if after > 0 {
+        spans.push(Span::styled("│".repeat(after), track_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_document(frame: &mut Frame, app: &mut WritermApp, area: Rect) {
@@ -639,6 +667,12 @@ mod tests {
     use tempfile::TempDir;
     use writerm_config::Config;
 
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.layout.paragraph_indent = false;
+        config
+    }
+
     fn rendered_buffer(terminal: &Terminal<TestBackend>) -> String {
         terminal
             .backend()
@@ -667,7 +701,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nBody text").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = rendered_buffer(&terminal);
@@ -675,7 +709,7 @@ mod tests {
         assert!(rendered.contains("note.md"));
         assert!(rendered.contains("Title"));
         assert!(rendered.contains("Body text"));
-        assert!(rendered.contains("Ctrl-S:save"));
+        assert!(rendered.contains("^S:save"));
         assert!(rendered.contains("F3:hd on"));
         assert!(rendered.contains("F2:files on"));
         assert!(rendered.contains(" WRITE "));
@@ -745,7 +779,7 @@ mod tests {
         std::fs::write(&path, "# Title").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -786,7 +820,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nBody text.").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -808,7 +842,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nBody text.").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -834,7 +868,7 @@ mod tests {
         std::fs::write(&path, "# Title").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -865,7 +899,7 @@ mod tests {
         .unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = rendered_buffer(&terminal);
@@ -905,7 +939,7 @@ mod tests {
         std::fs::write(&path, "one.").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.document_area = Rect::new(0, 0, 80, 1);
         // Park the cursor at the end of the existing text so typing extends
         // the document instead of inserting at position 0.
@@ -938,7 +972,7 @@ mod tests {
         std::fs::write(&path, "# Title").unwrap();
         let backend = TestBackend::new(60, 14);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = rendered_buffer(&terminal);
@@ -962,7 +996,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nHello there friend.").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         // Sanity check: with the sidebar visible, the metrics panel exists.
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -991,7 +1025,7 @@ mod tests {
         std::fs::write(&path, "alpha beta gamma delta epsilon zeta").unwrap();
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rows = rendered_rows(&terminal);
@@ -1007,14 +1041,14 @@ mod tests {
         std::fs::write(&path, "# Title").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let rendered = rendered_buffer(&terminal);
         // The Ctrl-M render label sits in the bottom keybar; on a narrow
         // terminal it may be truncated, so check for the prefix that's
         // always visible.
-        assert!(rendered.contains("Ctrl-M:render"));
+        assert!(rendered.contains("^M:render"));
         // In rendered mode the heading marker gutter shows a dim '#' and
         // the rendered text shows the heading content without ATX markers.
         // The source `# Title` text should not appear in the document area.
@@ -1024,7 +1058,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let source = rendered_buffer(&terminal);
 
-        assert!(source.contains("Ctrl-M:render"));
+        assert!(source.contains("^M:render"));
         // Source-peek mode renders the raw text including ATX markers.
         assert!(source.contains("# Title"));
     }
@@ -1036,7 +1070,7 @@ mod tests {
         std::fs::write(&path, "# Heading").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
         app.editor.move_cursor_to_char_pos(2);
@@ -1063,7 +1097,7 @@ mod tests {
         std::fs::write(&path, "# Heading").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
         app.source_peek = true;
@@ -1088,7 +1122,7 @@ mod tests {
         std::fs::write(&path, "hello").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
         app.editor.move_cursor_to_char_pos(5);
@@ -1115,7 +1149,7 @@ mod tests {
         std::fs::write(&path, "hello ").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1147,7 +1181,7 @@ mod tests {
         // +1 width to account for the 1-cell right margin.
         let backend = TestBackend::new(9, 4);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1174,7 +1208,7 @@ mod tests {
         std::fs::write(&path, "hello").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1208,7 +1242,7 @@ mod tests {
         std::fs::write(&path, "x\ty").unwrap();
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.source_peek = true;
         app.show_headings = false;
         app.show_files = false;
@@ -1237,7 +1271,7 @@ mod tests {
         std::fs::write(&path, "alpha").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1264,7 +1298,7 @@ mod tests {
         std::fs::write(&path, "alpha").unwrap();
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.source_peek = true;
         app.show_headings = false;
         app.show_files = false;
@@ -1311,7 +1345,7 @@ mod tests {
         .unwrap();
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1370,7 +1404,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nBody text").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1399,7 +1433,7 @@ mod tests {
         std::fs::write(&path, "Body text\n# Heading\nMore body").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1418,7 +1452,7 @@ mod tests {
         std::fs::write(&path, "### Deep").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1444,7 +1478,7 @@ mod tests {
         std::fs::write(&path, "# Title\n\nBody text.").unwrap();
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1475,7 +1509,7 @@ mod tests {
         std::fs::write(&path, "short").unwrap();
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1496,7 +1530,7 @@ mod tests {
         std::fs::write(&path, "abcdefghijklmnop").unwrap();
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
 
@@ -1567,7 +1601,7 @@ mod tests {
         std::fs::write(&path, "x *italic* y").unwrap();
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = WritermApp::with_config(Some(path), Config::default()).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
         app.show_headings = false;
         app.show_files = false;
         // source_peek is already false for .md files — be explicit.
@@ -1634,6 +1668,144 @@ mod tests {
             source_italic_cells.is_empty(),
             "Source-peek mode should not apply ITALIC modifier, found {} cells: {source_italic_cells:?}",
             source_italic_cells.len(),
+        );
+    }
+
+    // ── Scrollbar tests ───────────────────────────────────────────────
+
+    #[test]
+    fn scrollbar_renders_in_separator_column() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Generate enough lines to overflow a small viewport.
+        let content = (0..50)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
+        app.show_headings = false;
+        app.show_files = true;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // The separator must be present when the files sidebar is visible.
+        assert!(app.files_area.width > 0, "files sidebar should be visible");
+        assert!(
+            app.document_area.width > 0,
+            "document area should be visible"
+        );
+
+        let sep_x = app.document_area.x + app.document_area.width;
+        let doc_y = app.document_area.y;
+        let doc_h = app.document_area.height;
+
+        // Sample the separator column: should contain non-blank characters
+        // (either track '│' or thumb '█').
+        let mut non_blank_count = 0usize;
+        for row_off in 0..doc_h {
+            if let Some(cell) = buffer.cell((sep_x, doc_y + row_off))
+                && cell.symbol() != " "
+            {
+                non_blank_count += 1;
+            }
+        }
+        assert!(
+            non_blank_count > 0,
+            "separator column should have non-blank cells"
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_present_when_content_overflows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // Generate enough lines to overflow a small viewport.
+        let content = (0..50)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
+        app.show_headings = false;
+        app.show_files = true;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let sep_x = app.document_area.x + app.document_area.width;
+        let doc_y = app.document_area.y;
+        let doc_h = app.document_area.height;
+
+        // Count thumb ('█') cells. With 50 lines and a small viewport,
+        // the thumb should occupy a visible proportion of the track.
+        let thumb_cells: Vec<_> = (0..doc_h)
+            .filter(|row_off| {
+                buffer
+                    .cell((sep_x, doc_y + row_off))
+                    .is_some_and(|c| c.symbol() == "█")
+            })
+            .collect();
+        assert!(
+            !thumb_cells.is_empty(),
+            "scrollbar should render thumb (█) cells when content overflows viewport"
+        );
+        // Thumb should not occupy the entire track (there should be some
+        // track '│' cells too when content is much larger than viewport).
+        assert!(
+            thumb_cells.len() < doc_h as usize,
+            "thumb should not fill the entire separator column"
+        );
+    }
+
+    // ── Word progress in ribbon ─────────────────────────────────────
+
+    #[test]
+    fn ribbon_shows_cursor_word_progress() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one two three four five").unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
+        // Move cursor to the start of word "three" (char pos 8).
+        app.editor.move_cursor_to_char_pos(8);
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        // Should show "2 / 5 words" since cursor is before the third word
+        // (0-indexed: "one"=0, "two"=1, so before "three"=2).
+        assert!(
+            rendered.contains("2 / 5 words"),
+            "ribbon should show cursor word progress, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ribbon_shows_zero_for_empty_document() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "").unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = WritermApp::with_config(Some(path), test_config()).unwrap();
+        app.show_headings = false;
+        app.show_files = false;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_buffer(&terminal);
+
+        assert!(
+            rendered.contains("0 / 0 words"),
+            "empty doc should show 0 / 0 words, got: {rendered}"
         );
     }
 }

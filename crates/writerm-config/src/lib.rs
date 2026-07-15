@@ -48,6 +48,8 @@ pub struct LayoutConfig {
     pub headings_width: u16,
     #[serde(default = "default_files_width")]
     pub files_width: u16,
+    #[serde(default = "default_true")]
+    pub paragraph_indent: bool,
 }
 
 impl Default for UiConfig {
@@ -79,6 +81,7 @@ impl Default for LayoutConfig {
         Self {
             headings_width: default_headings_width(),
             files_width: default_files_width(),
+            paragraph_indent: true,
         }
     }
 }
@@ -137,6 +140,7 @@ mod tests {
         assert!(config.workspace.markdown_first);
         assert_eq!(config.layout.headings_width, 28);
         assert_eq!(config.layout.files_width, 34);
+        assert!(config.layout.paragraph_indent);
     }
 
     #[test]
@@ -156,6 +160,7 @@ mod tests {
             layout: LayoutConfig {
                 headings_width: 20,
                 files_width: 40,
+                paragraph_indent: false,
             },
         };
 

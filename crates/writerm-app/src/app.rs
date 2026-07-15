@@ -76,6 +76,7 @@ pub struct WritermApp {
     cached_visual_version: u64,
     cached_visual_width: usize,
     cached_visual_source_peek: bool,
+    cached_visual_paragraph_indent: bool,
     pub outline_entries: Vec<OutlineEntry>,
     pub workspace_entries: Vec<WorkspaceEntry>,
     pub workspace_summary: workspace::WorkspaceSummary,
@@ -86,6 +87,7 @@ pub struct WritermApp {
     pub show_headings: bool,
     pub show_files: bool,
     pub source_peek: bool,
+    pub paragraph_indent: bool,
     pub document_scroll: usize,
     pub heading_scroll: u16,
     pub prompt_mode: Option<PromptMode>,
@@ -102,6 +104,11 @@ pub struct WritermApp {
     desired_display_col: Option<usize>,
     last_edit: Option<Instant>,
     needs_redraw: bool,
+    /// Cache: buffer version when `word_byte_starts` was built.
+    word_progress_version: u64,
+    /// Sorted byte-start offsets of every whitespace-delimited word in
+    /// the current buffer text.  Rebuilt once per buffer version.
+    word_byte_starts: Vec<usize>,
 }
 
 impl WritermApp {
@@ -120,6 +127,7 @@ impl WritermApp {
         let rendered = render_markdown_mapped(&content);
         let outline_entries = outline::extract_outline(Some(&file), &content);
         let source_peek = !is_markdown_path(&file);
+        let paragraph_indent = config.layout.paragraph_indent;
         let mut workspace_options = WorkspaceOptions {
             show_hidden: config.workspace.show_hidden,
             sort_mode: WorkspaceSortMode::AlphaDirsFirst,
@@ -141,6 +149,7 @@ impl WritermApp {
             cached_visual_version: u64::MAX,
             cached_visual_width: 0,
             cached_visual_source_peek: !source_peek,
+            cached_visual_paragraph_indent: paragraph_indent,
             outline_entries,
             workspace_entries,
             workspace_summary,
@@ -151,6 +160,7 @@ impl WritermApp {
             show_headings: true,
             show_files: true,
             source_peek,
+            paragraph_indent,
             document_scroll: 0,
             heading_scroll: 0,
             prompt_mode: None,
@@ -167,6 +177,8 @@ impl WritermApp {
             desired_display_col: None,
             last_edit: None,
             needs_redraw: true,
+            word_progress_version: u64::MAX,
+            word_byte_starts: Vec::new(),
         })
     }
 
@@ -240,6 +252,18 @@ impl WritermApp {
             }
             KeyCode::F(2) => self.show_files = !self.show_files,
             KeyCode::F(3) => self.show_headings = !self.show_headings,
+            KeyCode::F(4) => {
+                self.paragraph_indent = !self.paragraph_indent;
+                self.notification = Some((
+                    if self.paragraph_indent {
+                        "Paragraph indent on".into()
+                    } else {
+                        "Paragraph indent off".into()
+                    },
+                    Instant::now(),
+                    false,
+                ));
+            }
             KeyCode::Char('n') if ctrl => {
                 self.prompt_mode = Some(PromptMode::NewFile);
                 self.prompt_buffer.clear();
@@ -706,9 +730,19 @@ impl WritermApp {
         let version = self.editor.buffer.version();
         let layout = self.heading_gutter_layout();
         let wrap_width = layout.text_width.max(1) as usize;
+        let indent_gutter = if self.paragraph_indent && !self.source_peek && wrap_width >= 3 {
+            2usize
+        } else {
+            0usize
+        };
+        // The visual document's wrap width is reduced so that indented
+        // first rows stay within the text area; the indent itself is
+        // injected later via apply_first_line_indent.
+        let effective_wrap = wrap_width.saturating_sub(indent_gutter).max(1);
         if self.cached_visual_version != version
             || self.cached_visual_width != wrap_width
             || self.cached_visual_source_peek != self.source_peek
+            || self.cached_visual_paragraph_indent != self.paragraph_indent
         {
             self.cached_visual = if self.source_peek {
                 crate::visual::VisualDocument::from_source(
@@ -717,16 +751,66 @@ impl WritermApp {
                     ratatui::style::Style::default().fg(theme::text_primary()),
                 )
             } else {
-                crate::visual::VisualDocument::from_rendered(&self.rendered, wrap_width)
+                crate::visual::VisualDocument::from_rendered(&self.rendered, effective_wrap)
             };
+            if self.paragraph_indent && !self.source_peek && indent_gutter > 0 {
+                self.cached_visual
+                    .apply_first_line_indent(&self.editor.text());
+            }
             self.cached_visual_version = version;
             self.cached_visual_width = wrap_width;
             self.cached_visual_source_peek = self.source_peek;
+            self.cached_visual_paragraph_indent = self.paragraph_indent;
         }
     }
 
     pub fn word_count(&self) -> usize {
         self.editor.text().split_whitespace().count()
+    }
+
+    /// Build the sorted byte-start offsets of every whitespace-delimited
+    /// word in `text`.  The list is ordered; binary search can find the
+    /// word index for any byte position in O(log n).
+    fn build_word_starts(text: &str) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut in_word = false;
+        for (byte_pos, ch) in text.char_indices() {
+            if ch.is_whitespace() {
+                in_word = false;
+            } else if !in_word {
+                starts.push(byte_pos);
+                in_word = true;
+            }
+        }
+        starts
+    }
+
+    /// Return `(cursor_word_index, total_words)` for the current cursor
+    /// position.  Both counts are zero for empty / whitespace-only
+    /// documents.  The backing sorted index is rebuilt once per buffer
+    /// version and persisted across draws so cursor-only moves are cheap.
+    pub fn cursor_word_progress(&mut self) -> (usize, usize) {
+        let version = self.editor.buffer.version();
+        if self.word_progress_version != version {
+            // One full-text clone per buffer version is acceptable here.
+            self.word_byte_starts = Self::build_word_starts(&self.editor.text());
+            self.word_progress_version = version;
+        }
+        let total = self.word_byte_starts.len();
+        if total == 0 {
+            return (0, 0);
+        }
+        let rope = self.editor.buffer.rope();
+        let char_pos = self.editor.cursor_char_pos().min(rope.len_chars());
+        // O(log n) char → byte via the Rope, vs the old O(n) char_indices loop.
+        let byte_pos = rope.char_to_byte(char_pos);
+        // `partition_point` returns the index of the first word whose
+        // start is NOT strictly before `byte_pos`, i.e. the count of
+        // words that have begun before the cursor.
+        let cursor = self
+            .word_byte_starts
+            .partition_point(|&start| start < byte_pos);
+        (cursor.min(total), total)
     }
 
     /// Snapshot the current editor's document-length metrics for display in
@@ -792,6 +876,10 @@ impl WritermApp {
         self.refresh_render_cache();
         self.refresh_visual_cache();
         self.cached_visual.clone()
+    }
+
+    pub fn visual_rows_len(&self) -> usize {
+        self.cached_visual.rows.len()
     }
 
     /// Build every visual row for the headings/section-browser panel.
@@ -1173,7 +1261,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn app_at(path: PathBuf) -> WritermApp {
-        WritermApp::with_config(Some(path), Config::default()).unwrap()
+        let mut config = Config::default();
+        config.layout.paragraph_indent = false;
+        WritermApp::with_config(Some(path), config).unwrap()
     }
 
     #[test]
@@ -2595,5 +2685,214 @@ mod tests {
         let layout = app.heading_gutter_layout();
         assert_eq!(layout.text_width, 17);
         assert!(visual.row_width(0).unwrap() <= layout.text_width as usize);
+    }
+
+    // ── cursor_word_progress tests ────────────────────────────────────
+
+    #[test]
+    fn word_progress_empty_doc_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "").unwrap();
+        let mut app = app_at(path);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!((cursor, total), (0, 0));
+    }
+
+    #[test]
+    fn word_progress_whitespace_only_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "   \n  \n  ").unwrap();
+        let mut app = app_at(path);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!((cursor, total), (0, 0));
+    }
+
+    #[test]
+    fn word_progress_at_start() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one two three").unwrap();
+        let mut app = app_at(path);
+        app.editor.move_cursor_to_char_pos(0);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!(cursor, 0);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn word_progress_at_end() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one two three").unwrap();
+        let mut app = app_at(path);
+        let len = app.editor.text().chars().count();
+        app.editor.move_cursor_to_char_pos(len);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!(cursor, 3);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn word_progress_mid_word() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+        let mut app = app_at(path);
+        // "alpha beta gamma"
+        //  a(0) l(1) p(2) h(3) a(4) ' '(5) b(6) e(7) t(8) a(9)
+        // Cursor at pos 7 = 'e'. Text before cursor byte: "alpha b"
+        // split_whitespace → ["alpha", "b"] = 2 words.
+        app.editor.move_cursor_to_char_pos(7);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!(cursor, 2, "2 words before cursor inside 'beta'");
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn word_progress_with_unicode_characters() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        // "café résumé naïveté" — 3 words
+        std::fs::write(&path, "café résumé naïveté").unwrap();
+        let mut app = app_at(path);
+        // Cursor at the start of "résumé": "café " = 5 chars.
+        app.editor.move_cursor_to_char_pos(5);
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!(cursor, 1);
+        assert_eq!(total, 3);
+
+        // Cursor inside "café" at position 3 (the 'é').
+        // Byte slice before the cursor: "caf". This is a fragment of one
+        // word (no whitespace), so split_whitespace counts it as 1 token.
+        app.editor.move_cursor_to_char_pos(3);
+        let (cursor2, total2) = app.cursor_word_progress();
+        assert_eq!(cursor2, 1, "cursor inside first word gives 1 word");
+        assert_eq!(total2, 3);
+    }
+
+    #[test]
+    fn word_progress_updates_after_typing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello").unwrap();
+        let mut app = app_at(path);
+        app.editor.move_cursor_to_char_pos(5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        let (cursor, total) = app.cursor_word_progress();
+        assert_eq!(total, 2, "should now have 2 words");
+        assert_eq!(cursor, 2, "cursor should be past both words");
+    }
+
+    #[test]
+    fn word_progress_cache_reuses_across_cursor_moves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "one two three four five six").unwrap();
+        let mut app = app_at(path);
+
+        // Prime the cache.
+        let v1 = app.editor.buffer.version();
+        let (_c1, t1) = app.cursor_word_progress();
+        assert_eq!(t1, 6);
+
+        // Move cursor twice; results must be consistent with the cache
+        // (the index is NOT rebuilt because the buffer version hasn't
+        // changed).
+        app.editor.move_cursor_to_char_pos(0);
+        let (c2, t2) = app.cursor_word_progress();
+        assert_eq!(c2, 0, "cursor at start");
+        assert_eq!(t2, 6);
+
+        // Cursor at the 't' of "three": pos 8 → 2 words before.
+        app.editor.move_cursor_to_char_pos(8);
+        let (c3, t3) = app.cursor_word_progress();
+        assert_eq!(c3, 2, "2 words before 'three'");
+        assert_eq!(t3, 6);
+        assert_eq!(v1, app.editor.buffer.version(), "version unchanged");
+    }
+
+    #[test]
+    fn word_progress_after_edit_rebuilds_cache() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "hello world").unwrap();
+        let mut app = app_at(path);
+
+        let v1 = app.editor.buffer.version();
+        let (_c1, t1) = app.cursor_word_progress();
+        assert_eq!(t1, 2);
+
+        // Move to end, then type a new word.
+        let end = app.editor.text().chars().count();
+        app.editor.move_cursor_to_char_pos(end);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        assert_ne!(v1, app.editor.buffer.version(), "version should change");
+        let (_c2, t2) = app.cursor_word_progress();
+        assert_eq!(t2, 3, "should now have 3 words");
+    }
+
+    // ── Narrow-width indent regression test ─────────────────────────
+
+    #[test]
+    fn indent_at_width_one_does_not_panic_or_overflow() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Abc").unwrap();
+        let mut app = app_at(path);
+        app.source_peek = false;
+        app.paragraph_indent = true;
+        // Force document area so text_width = 1 (heading depth 0 → no
+        // gutter, margin = 1, wrap = 1).
+        app.document_area = Rect::new(0, 0, 2, 10);
+        let visual = app.visual_document();
+        // Indented row width must NOT exceed the wrap width + indent
+        // (which saturates).  Check that every row has width ≤ 2.
+        for idx in 0..visual.rows.len() {
+            let w = visual.row_width(idx).unwrap_or(0);
+            assert!(
+                w <= 2,
+                "row {idx} width {w} must not overflow at wrap_width=1"
+            );
+        }
+    }
+
+    #[test]
+    fn indent_at_width_two_fits_exactly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "Hi").unwrap();
+        let mut app = app_at(path);
+        app.source_peek = false;
+        app.paragraph_indent = true;
+        // text area = 3 cells gives wrap_width = 3, minus indent = 1.
+        app.document_area = Rect::new(0, 0, 4, 10);
+        let visual = app.visual_document();
+        for idx in 0..visual.rows.len() {
+            let w = visual.row_width(idx).unwrap_or(0);
+            assert!(
+                w <= 3,
+                "row {idx} width {w} must not overflow at effective_wrap=1"
+            );
+        }
     }
 }
